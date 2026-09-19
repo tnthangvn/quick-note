@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Quick Note
+GenericName=Sticky Notes
+Comment=Ghi chú nhanh dạng sticky note, nhiều trang, đồng bộ Google Drive
+Exec=quick-note
+Icon=quick-note
+Terminal=false
+Categories=Utility;
+Keywords=note;notes;sticky;memo;ghi chú;
+StartupWMClass=quick-note
