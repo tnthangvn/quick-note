@@ -207,6 +207,22 @@ pub fn continued_marker(line: &str) -> Option<String> {
     Some(format!("{indent}{marker}"))
 }
 
+/// Dọn đoạn chữ dán từ trình duyệt: `<br>` thành xuống dòng, ký tự HTML thành
+/// ký tự thật. Giữ nguyên mọi thứ khác (không phải bộ chuyển HTML đầy đủ).
+pub fn clean_pasted(text: &str) -> String {
+    const BREAKS: [&str; 4] = ["<br>", "<br/>", "<br />", "<BR>"];
+    let mut out = text.to_string();
+    for tag in BREAKS {
+        out = out.replace(tag, "\n");
+    }
+    out.replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +292,23 @@ mod tests {
                 Span::Quote
             ]
         );
+    }
+
+    #[test]
+    fn don_the_br_va_ky_tu_html_khi_dan() {
+        assert_eq!(clean_pasted("A<br>B<br />C"), "A\nB\nC");
+        assert_eq!(clean_pasted("a &amp; b&nbsp;c"), "a & b c");
+        assert_eq!(clean_pasted("&lt;div&gt;"), "<div>");
+        assert_eq!(
+            clean_pasted("giữ nguyên chữ thường"),
+            "giữ nguyên chữ thường"
+        );
+    }
+
+    #[test]
+    fn giai_ma_amp_sau_cung_de_khong_dich_hai_lan() {
+        // "&amp;lt;" phải ra "&lt;", không phải "<".
+        assert_eq!(clean_pasted("&amp;lt;"), "&lt;");
     }
 
     #[test]

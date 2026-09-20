@@ -40,9 +40,32 @@ pub fn clipboard_image() -> Option<Pasted> {
         return Some(Pasted::File(path));
     }
     // Copy từ trình duyệt hay chỉ cho `text/html` kèm <img src="…">.
-    let html = wl_paste(&["--type", "text/html"])?;
-    let src = img_src(&String::from_utf8_lossy(&html))?;
-    fetch_image(&src)
+    if let Some(html) = wl_paste(&["--type", "text/html"])
+        && let Some(src) = img_src(&String::from_utf8_lossy(&html))
+        && let Some(found) = fetch_image(&src)
+    {
+        return Some(found);
+    }
+    // Nautilus (GNOME mới) copy file chỉ để lại đường dẫn dạng chữ.
+    let text = wl_paste(&[])?;
+    image_from_text(&String::from_utf8_lossy(&text)).map(Pasted::File)
+}
+
+/// `true` nếu clipboard có ảnh dán được (dùng để chặn Ctrl+V trước ô soạn thảo).
+pub fn clipboard_has_image() -> bool {
+    clipboard_image().is_some()
+}
+
+/// Đường dẫn ảnh nằm trong đoạn chữ: `file:///…` hoặc `/home/…/a.png`.
+pub fn image_from_text(text: &str) -> Option<PathBuf> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| match line.strip_prefix("file://") {
+            Some(path) => PathBuf::from(percent_decode(path)),
+            None => PathBuf::from(line),
+        })
+        .find(|path| is_image(path) && path.is_file())
 }
 
 /// Giá trị `src` của thẻ `<img>` đầu tiên trong đoạn HTML.
@@ -274,6 +297,32 @@ mod tests {
             path.display().to_string().replace(' ', "%20")
         );
         assert_eq!(image_from_uris(&uris).as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn lay_duoc_duong_dan_anh_tu_chu() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jpeg");
+        std::fs::write(&path, b"khong-phai-anh-that").unwrap();
+        // Nautilus dán kiểu này: một dòng đường dẫn tuyệt đối.
+        assert_eq!(
+            image_from_text(&format!("{}\n", path.display())).as_deref(),
+            Some(path.as_path())
+        );
+        // Hoặc dạng file:// có mã hoá khoảng trắng.
+        let spaced = dir.path().join("có dấu.png");
+        std::fs::write(&spaced, b"x").unwrap();
+        let uri = format!(
+            "file://{}",
+            spaced.display().to_string().replace(' ', "%20")
+        );
+        assert_eq!(image_from_text(&uri).as_deref(), Some(spaced.as_path()));
+    }
+
+    #[test]
+    fn bo_qua_chu_khong_phai_duong_dan_anh() {
+        assert_eq!(image_from_text("ghi chú bình thường"), None);
+        assert_eq!(image_from_text("/khong/ton/tai.png"), None);
     }
 
     #[test]

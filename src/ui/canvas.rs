@@ -103,7 +103,6 @@ struct NoteOutput {
     changed: bool,
     delete: bool,
     split: bool,
-    paste_image: bool,
     /// Chuyển note sang chế độ sửa (để bôi đen được).
     edit: bool,
 }
@@ -162,6 +161,9 @@ pub fn show(
         out.changed = true;
     }
 
+    out.paste_image = intercept_paste(ui, state.editing_body);
+    clean_pasted_text(ui);
+
     // Nhớ vùng bôi đen gần nhất: khi bấm nút », ô soạn thảo xử lý cú nhấn
     // trước và xoá vùng chọn, nên không thể đọc "sống" tại thời điểm đó.
     if let Some(sel) = state
@@ -191,9 +193,6 @@ pub fn show(
         }
         if res.split {
             out.split = Some(note.id);
-        }
-        if res.paste_image {
-            out.paste_image = Some(note.id);
         }
         if res.edit {
             state.editing_body = Some(note.id);
@@ -228,6 +227,38 @@ fn topmost_at_rects(
         .rev()
         .find(|n| rects.get(&n.id).is_some_and(|r| r.contains(pos)))
         .map(|n| n.id)
+}
+
+/// Ctrl+V: nếu clipboard có ảnh thì chặn luôn, không để ô soạn thảo dán
+/// đường dẫn/HTML vào nội dung. Clipboard chỉ có chữ thì để nguyên cho nó dán.
+fn intercept_paste(ui: &Ui, editing: Option<Uuid>) -> Option<Uuid> {
+    let note = editing?;
+    let pressed = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V));
+    if !pressed || !crate::attach::clipboard_has_image() {
+        return None;
+    }
+    ui.ctx().input_mut(|i| {
+        i.events.retain(|e| !matches!(e, egui::Event::Paste(_)));
+        i.raw.events.retain(|e| !matches!(e, egui::Event::Paste(_)));
+    });
+    Some(note)
+}
+
+/// Dán chữ từ trình duyệt hay kèm `<br>` và ký tự HTML — dọn trước khi nó
+/// vào nội dung note.
+fn clean_pasted_text(ui: &Ui) {
+    ui.ctx().input_mut(|i| {
+        for events in [&mut i.events, &mut i.raw.events] {
+            for event in events.iter_mut() {
+                if let egui::Event::Paste(text) = event {
+                    let cleaned = md_highlight::clean_pasted(text);
+                    if cleaned != *text {
+                        *text = cleaned;
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Ctrl + scroll (or pinch) zooms around the pointer.
@@ -292,7 +323,9 @@ fn note_ui(
             .max_rect(rect)
             .layout(Layout::top_down(Align::Min)),
     );
-    ui.set_clip_rect(canvas);
+    // Cắt theo chính khung note (chừa chỗ cho bóng đổ): nội dung rộng như
+    // bảng Markdown sẽ không vẽ tràn ra canvas nữa.
+    ui.set_clip_rect(rect.expand(4.0).intersect(canvas));
     ui.style_mut().visuals = egui::Visuals::light();
     // The default fade uses the panel colour, which shows as a dark band on pastel notes.
     ui.style_mut().spacing.scroll.fade.strength = 0.0;
@@ -545,7 +578,7 @@ fn body_ui(
             .max_rect(body)
             .layout(Layout::top_down(Align::Min)),
     );
-    egui::ScrollArea::vertical()
+    egui::ScrollArea::both()
         .id_salt(("note-scroll", note.id))
         .auto_shrink(false)
         .show(&mut area, |ui| {
@@ -595,11 +628,6 @@ fn edit_body(
     }
     if resp.has_focus() {
         continue_list(ui, note, &output, out);
-        // Ctrl+V: ô soạn thảo tự dán chữ. Không "ăn" phím tắt ở đây — chỉ báo
-        // cho app kiểm tra xem clipboard có ảnh không.
-        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
-            out.paste_image = true;
-        }
     }
     if split_button(ui, &output, note.id, state.selection) {
         out.split = true;
