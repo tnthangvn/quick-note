@@ -5,9 +5,10 @@ use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde::Deserialize;
 use url::Url;
 
-use super::oauth::Session;
+use super::TokenSource;
 
 const FILES_URL: &str = "https://www.googleapis.com/drive/v3/files";
+const DRIVES_URL: &str = "https://www.googleapis.com/drive/v3/drives";
 const UPLOAD_URL: &str = "https://www.googleapis.com/upload/drive/v3/files";
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 
@@ -23,16 +24,16 @@ struct FileList {
 
 pub struct Drive<'a> {
     http: &'a Client,
-    session: &'a mut Session,
+    auth: &'a mut dyn TokenSource,
 }
 
 impl<'a> Drive<'a> {
-    pub fn new(http: &'a Client, session: &'a mut Session) -> Self {
-        Self { http, session }
+    pub fn new(http: &'a Client, auth: &'a mut dyn TokenSource) -> Self {
+        Self { http, auth }
     }
 
     fn send(&mut self, req: RequestBuilder) -> Result<Response> {
-        let token = self.session.access_token(self.http)?;
+        let token = self.auth.token(self.http)?;
         let resp = req.bearer_auth(token).send().context("gọi Drive API")?;
         let status = resp.status();
         if !status.is_success() {
@@ -49,13 +50,67 @@ impl<'a> Drive<'a> {
             .append_pair("fields", "files(id)")
             .append_pair("orderBy", "modifiedTime desc")
             .append_pair("pageSize", "100")
-            .append_pair("spaces", "drive");
+            .append_pair("spaces", "drive")
+            // Service accounts keep their files in Shared Drives.
+            .append_pair("supportsAllDrives", "true")
+            .append_pair("includeItemsFromAllDrives", "true")
+            .append_pair("corpora", "allDrives");
         let req = self.http.get(url);
         Ok(self.send(req)?.json::<FileList>()?.files)
     }
 
     /// Returns the folder id: the configured one, or find-or-create by name in My Drive root.
-    pub fn ensure_folder(&mut self, folder_id: &str, folder_name: &str) -> Result<String> {
+    /// Các Shared Drive mà tài khoản hiện tại là thành viên: `(id, tên)`.
+    pub fn shared_drives(&mut self) -> Result<Vec<(String, String)>> {
+        let mut url = Url::parse(DRIVES_URL)?;
+        url.query_pairs_mut()
+            .append_pair("pageSize", "100")
+            .append_pair("fields", "drives(id,name)");
+        let req = self.http.get(url);
+        let body: serde_json::Value = self.send(req)?.json()?;
+        Ok(body["drives"]
+            .as_array()
+            .map(|drives| {
+                drives
+                    .iter()
+                    .filter_map(|d| {
+                        Some((
+                            d["id"].as_str()?.to_string(),
+                            d["name"].as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Thư mục mà tài khoản hiện tại nhìn thấy, kèm `driveId` nếu nằm trong
+    /// Shared Drive (dùng cho lệnh kiểm tra cấu hình).
+    pub fn visible_folders(&mut self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let mut url = Url::parse(FILES_URL)?;
+        url.query_pairs_mut()
+            .append_pair(
+                "q",
+                &format!("mimeType = '{FOLDER_MIME}' and trashed = false"),
+            )
+            .append_pair("fields", "files(id,name,driveId,ownedByMe)")
+            .append_pair("pageSize", &limit.to_string())
+            .append_pair("supportsAllDrives", "true")
+            .append_pair("includeItemsFromAllDrives", "true")
+            .append_pair("corpora", "allDrives");
+        let req = self.http.get(url);
+        let body: serde_json::Value = self.send(req)?.json()?;
+        Ok(body["files"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Thư mục đích: `folder_id` nếu có, không thì tìm/tạo `folder_name` ngay
+    /// trong `parent` (gốc My Drive, hoặc gốc một Shared Drive).
+    pub fn ensure_folder(
+        &mut self,
+        folder_id: &str,
+        folder_name: &str,
+        parent: &str,
+    ) -> Result<String> {
         if !folder_id.trim().is_empty() {
             let mut url = Url::parse(&format!("{FILES_URL}/{}", folder_id.trim()))?;
             url.query_pairs_mut()
@@ -68,14 +123,18 @@ impl<'a> Drive<'a> {
             return Ok(folder_id.trim().to_string());
         }
         let q = format!(
-            "name = '{}' and mimeType = '{FOLDER_MIME}' and 'root' in parents and trashed = false",
-            escape_query(folder_name)
+            "name = '{}' and mimeType = '{FOLDER_MIME}' and '{}' in parents and trashed = false",
+            escape_query(folder_name),
+            escape_query(parent)
         );
         if let Some(found) = self.list(&q)?.into_iter().next() {
             return Ok(found.id);
         }
-        let body = serde_json::json!({ "name": folder_name, "mimeType": FOLDER_MIME, "parents": ["root"] });
-        let req = self.http.post(format!("{FILES_URL}?fields=id")).json(&body);
+        let body = serde_json::json!({ "name": folder_name, "mimeType": FOLDER_MIME, "parents": [parent] });
+        let req = self
+            .http
+            .post(format!("{FILES_URL}?fields=id&supportsAllDrives=true"))
+            .json(&body);
         let created: serde_json::Value = self.send(req)?.json()?;
         created["id"]
             .as_str()
@@ -101,7 +160,10 @@ impl<'a> Drive<'a> {
         content: Vec<u8>,
     ) -> Result<String> {
         if let Some(existing) = self.find_in_folder(folder_id, name)? {
-            let url = format!("{UPLOAD_URL}/{}?uploadType=media&fields=id", existing.id);
+            let url = format!(
+                "{UPLOAD_URL}/{}?uploadType=media&fields=id&supportsAllDrives=true",
+                existing.id
+            );
             let req = self
                 .http
                 .patch(url)
@@ -115,7 +177,9 @@ impl<'a> Drive<'a> {
         let (boundary, body) = multipart_related(&metadata, mime, &content);
         let req = self
             .http
-            .post(format!("{UPLOAD_URL}?uploadType=multipart&fields=id"))
+            .post(format!(
+                "{UPLOAD_URL}?uploadType=multipart&fields=id&supportsAllDrives=true"
+            ))
             .header(
                 "Content-Type",
                 format!("multipart/related; boundary={boundary}"),
@@ -129,7 +193,9 @@ impl<'a> Drive<'a> {
     }
 
     pub fn download(&mut self, file_id: &str) -> Result<Vec<u8>> {
-        let req = self.http.get(format!("{FILES_URL}/{file_id}?alt=media"));
+        let req = self.http.get(format!(
+            "{FILES_URL}/{file_id}?alt=media&supportsAllDrives=true"
+        ));
         Ok(self.send(req)?.bytes()?.to_vec())
     }
 }

@@ -30,6 +30,9 @@ pub struct Note {
     pub pinned: bool,
     #[serde(default)]
     pub updated_at: i64,
+    /// Mã dạng `RV-3`, cấp khi note được tách ra từ một note khác.
+    #[serde(default)]
+    pub ticket: Option<String>,
 }
 
 impl Note {
@@ -43,6 +46,7 @@ impl Note {
             color: color % NOTE_COLORS.len(),
             pinned: false,
             updated_at: now_ts(),
+            ticket: None,
         }
     }
 
@@ -81,6 +85,28 @@ pub struct Page {
     pub links: Vec<Link>,
 }
 
+/// How a link is routed between two notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LinkStyle {
+    /// Horizontal/vertical segments with one right-angle bend (default).
+    #[default]
+    Elbow,
+    Straight,
+    Curve,
+}
+
+impl LinkStyle {
+    pub const ALL: [Self; 3] = [Self::Elbow, Self::Straight, Self::Curve];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Elbow => "Bẻ góc vuông",
+            Self::Straight => "Đường thẳng",
+            Self::Curve => "Đường cong",
+        }
+    }
+}
+
 /// A directed arrow from one note to another.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Link {
@@ -89,8 +115,15 @@ pub struct Link {
     pub to: Uuid,
     #[serde(default)]
     pub label: String,
-    #[serde(default)]
+    /// Dashed by default; the dashes animate along the arrow.
+    #[serde(default = "default_dashed")]
     pub dashed: bool,
+    #[serde(default)]
+    pub style: LinkStyle,
+}
+
+fn default_dashed() -> bool {
+    true
 }
 
 impl Link {
@@ -100,7 +133,8 @@ impl Link {
             from,
             to,
             label: String::new(),
-            dashed: false,
+            dashed: true,
+            style: LinkStyle::default(),
         }
     }
 
@@ -111,6 +145,35 @@ impl Link {
 
 fn default_zoom() -> f32 {
     1.0
+}
+
+/// Dùng khi note cha không có tiêu đề nào dùng được.
+pub const TICKET_FALLBACK: &str = "QN";
+/// Độ dài tối đa của tiền tố ticket.
+const TICKET_PREFIX_LEN: usize = 4;
+
+/// Tiền tố ticket lấy từ tiêu đề note cha: chữ và số của từ đầu tiên, viết hoa.
+/// Ví dụ: "RV" → `RV`, "Rà soát UX" → `RA`, "" → `QN`.
+pub fn ticket_prefix(title: &str) -> String {
+    let prefix: String = title
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(TICKET_PREFIX_LEN)
+        .collect();
+    if prefix.is_empty() {
+        TICKET_FALLBACK.to_string()
+    } else {
+        prefix.to_uppercase()
+    }
+}
+
+/// Tách `RV-12` thành ("RV", 12).
+fn parse_ticket(ticket: &str) -> Option<(&str, u32)> {
+    let (prefix, number) = ticket.rsplit_once('-')?;
+    Some((prefix, number.parse().ok()?))
 }
 
 pub const ZOOM_MIN: f32 = 0.3;
@@ -176,6 +239,28 @@ impl Page {
         }
         self.links.push(Link::new(from, to));
         true
+    }
+
+    /// Tạo note con từ `text`, đặt cạnh note cha và nối mũi tên cha → con.
+    /// Trả về id note con; phần neo để chèn lại vào note cha do `anchor()` dựng.
+    pub fn split_note(&mut self, parent: Uuid, text: &str, ticket: String) -> Option<Uuid> {
+        let parent_note = self.notes.iter().find(|n| n.id == parent)?;
+        let children = self.links.iter().filter(|l| l.from == parent).count() as f32;
+        let pos = [
+            parent_note.pos[0] + parent_note.size[0] + 60.0,
+            parent_note.pos[1] + children * (DEFAULT_NOTE_SIZE[1] + 24.0),
+        ];
+        let color = parent_note.color;
+        let id = self.add_note_at(pos);
+        let child = self.notes.last_mut()?;
+        child.color = color;
+        child.ticket = Some(ticket);
+        let text = text.trim();
+        let (title, body) = text.split_once('\n').unwrap_or((text, ""));
+        child.title = title.trim().to_string();
+        child.body = body.trim_start().to_string();
+        self.connect(parent, id);
+        Some(id)
     }
 
     pub fn remove_link(&mut self, id: Uuid) -> Option<Link> {
@@ -289,6 +374,31 @@ impl Workspace {
             note.color %= NOTE_COLORS.len();
         }
         self
+    }
+
+    /// Số tiếp theo chưa dùng của tiền tố này (xét toàn workspace).
+    pub fn next_ticket(&self, prefix: &str) -> String {
+        let used = self
+            .pages
+            .iter()
+            .flat_map(|p| p.notes.iter())
+            .filter_map(|n| n.ticket.as_deref())
+            .filter_map(parse_ticket)
+            .filter(|(p, _)| *p == prefix)
+            .map(|(_, n)| n)
+            .max()
+            .unwrap_or(0);
+        format!("{prefix}-{}", used + 1)
+    }
+
+    /// Tiền tố dùng cho note con của `parent`: nối tiếp ticket của cha nếu có.
+    pub fn ticket_prefix_for_child(&self, parent: &Note) -> String {
+        parent
+            .ticket
+            .as_deref()
+            .and_then(parse_ticket)
+            .map(|(prefix, _)| prefix.to_string())
+            .unwrap_or_else(|| ticket_prefix(parent.display_title()))
     }
 
     pub fn touch(&mut self) {
@@ -414,6 +524,79 @@ mod tests {
     }
 
     #[test]
+    fn ticket_prefix_uses_first_word_uppercase() {
+        assert_eq!(ticket_prefix("RV"), "RV");
+        assert_eq!(ticket_prefix("rv-backend nâng cấp"), "RVBA");
+        assert_eq!(ticket_prefix("Rà soát UX"), "R");
+        assert_eq!(ticket_prefix("   "), TICKET_FALLBACK);
+        assert_eq!(ticket_prefix("→→→"), TICKET_FALLBACK);
+    }
+
+    #[test]
+    fn next_ticket_continues_after_the_highest_used() {
+        let mut ws = Workspace::default();
+        let page = ws.active_page_mut();
+        let a = page.add_note([0.0, 0.0]);
+        let b = page.add_note([0.0, 0.0]);
+        page.notes[0].ticket = Some("RV-2".into());
+        page.notes[1].ticket = Some("QN-9".into());
+        assert_eq!(ws.next_ticket("RV"), "RV-3");
+        assert_eq!(ws.next_ticket("QN"), "QN-10");
+        assert_eq!(ws.next_ticket("ABC"), "ABC-1");
+        let _ = (a, b);
+    }
+
+    #[test]
+    fn child_ticket_prefix_follows_the_parent() {
+        let mut ws = Workspace::default();
+        let page = ws.active_page_mut();
+        page.add_note([0.0, 0.0]);
+        page.notes[0].title = "RV backlog".into();
+        assert_eq!(ws.ticket_prefix_for_child(&ws.pages[0].notes[0]), "RV");
+
+        ws.pages[0].notes[0].ticket = Some("ABC-4".into());
+        assert_eq!(ws.ticket_prefix_for_child(&ws.pages[0].notes[0]), "ABC");
+    }
+
+    #[test]
+    fn split_note_creates_a_linked_child() {
+        let mut page = Page::new("p");
+        let parent = page.add_note([100.0, 50.0]);
+        page.notes[0].size = [200.0, 150.0];
+        let child = page
+            .split_note(parent, "update độ tuổi\nchi tiết ở đây", "RV-3".into())
+            .unwrap();
+
+        let note = page.notes.iter().find(|n| n.id == child).unwrap();
+        assert_eq!(note.title, "update độ tuổi");
+        assert_eq!(note.body, "chi tiết ở đây");
+        assert_eq!(note.ticket.as_deref(), Some("RV-3"));
+        assert_eq!(note.pos[0], 360.0, "đặt bên phải note cha");
+        assert_eq!(page.links.len(), 1);
+        assert_eq!((page.links[0].from, page.links[0].to), (parent, child));
+    }
+
+    #[test]
+    fn split_note_stacks_children_downwards() {
+        let mut page = Page::new("p");
+        let parent = page.add_note([0.0, 0.0]);
+        let first = page.split_note(parent, "một", "RV-1".into()).unwrap();
+        let second = page.split_note(parent, "hai", "RV-2".into()).unwrap();
+        let y = |id| page.notes.iter().find(|n| n.id == id).unwrap().pos[1];
+        assert!(y(second) > y(first));
+        assert_eq!(page.links.len(), 2);
+    }
+
+    #[test]
+    fn split_note_rejects_an_unknown_parent() {
+        let mut page = Page::new("p");
+        assert!(
+            page.split_note(Uuid::new_v4(), "x", "RV-1".into())
+                .is_none()
+        );
+    }
+
+    #[test]
     fn connect_rejects_self_loops_duplicates_and_unknown_notes() {
         let mut page = Page::new("p");
         let a = page.add_note([0.0, 0.0]);
@@ -424,6 +607,21 @@ mod tests {
         assert!(!page.connect(a, a), "self loop");
         assert!(!page.connect(a, Uuid::new_v4()), "unknown note");
         assert_eq!(page.links.len(), 1);
+    }
+
+    #[test]
+    fn new_links_are_dashed_and_old_files_default_to_dashed() {
+        let mut page = Page::new("p");
+        let a = page.add_note([0.0, 0.0]);
+        let b = page.add_note([0.0, 0.0]);
+        page.connect(a, b);
+        assert!(page.links[0].dashed);
+
+        let link: Link = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000000","from":"00000000-0000-0000-0000-000000000000","to":"00000000-0000-0000-0000-000000000001"}"#,
+        )
+        .unwrap();
+        assert!(link.dashed);
     }
 
     #[test]

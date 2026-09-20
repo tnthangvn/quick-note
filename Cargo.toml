@@ -18,6 +18,9 @@ webbrowser = "1"
 dirs = "7"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1"
+aws-lc-rs = "1"
+signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 egui_commonmark = { version = "0.25", default-features = false }
 winit = { version = "0.30", default-features = false, features = ["x11"] }
 x11rb = { version = "0.13", default-features = false, features = ["shape"] }

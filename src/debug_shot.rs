@@ -4,13 +4,18 @@
 use std::io::Write;
 
 const WARMUP_FRAMES: u64 = 20;
+// QUICK_NOTE_SCREENSHOT_FRAME cho phép chụp trễ hơn khi cần quan sát animation.
 
 pub fn tick(ctx: &egui::Context) {
     let Ok(path) = std::env::var("QUICK_NOTE_SCREENSHOT") else {
         return;
     };
     let frame = ctx.cumulative_frame_nr();
-    if frame == WARMUP_FRAMES {
+    let target = std::env::var("QUICK_NOTE_SCREENSHOT_FRAME")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(WARMUP_FRAMES);
+    if frame == target {
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
     }
     ctx.request_repaint();

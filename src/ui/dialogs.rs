@@ -7,7 +7,7 @@ use crate::model::Workspace;
 
 pub enum SettingsResult {
     Keep,
-    Save(Config),
+    Save(Box<Config>),
     Cancel,
     Logout,
 }
@@ -45,6 +45,20 @@ pub fn settings(
                 ui.label("Tên thư mục");
                 ui.add(TextEdit::singleline(&mut draft.drive.folder_name).desired_width(300.0));
                 ui.end_row();
+                ui.label("Service account key");
+                ui.add(
+                    TextEdit::singleline(&mut draft.drive.service_account_key)
+                        .hint_text("đường dẫn file JSON — để trống = đăng nhập bằng trình duyệt")
+                        .desired_width(300.0),
+                );
+                ui.end_row();
+                ui.label("Đóng vai (email)");
+                ui.add(
+                    TextEdit::singleline(&mut draft.drive.impersonate)
+                        .hint_text("email Workspace của bạn — cần uỷ quyền toàn miền")
+                        .desired_width(300.0),
+                );
+                ui.end_row();
                 ui.label("Folder ID (tuỳ chọn)");
                 ui.add(
                     TextEdit::singleline(&mut draft.drive.folder_id)
@@ -53,9 +67,26 @@ pub fn settings(
                 );
                 ui.end_row();
             });
-            ui.label(RichText::new(
-                "Folder ID lấy từ URL drive.google.com/drive/folders/<ID>. Dùng folder có sẵn cần quyền Drive đầy đủ; để trống thì app chỉ thấy file nó tạo (an toàn hơn).",
-            ).small().weak());
+            if draft.drive.uses_service_account() {
+                ui.label(
+                    RichText::new(
+                        "Đang dùng service account: chỉ cần file key. App tự tìm Shared Drive mà \
+                         service account là thành viên rồi tạo thư mục theo tên ở trên. Nhớ thêm \
+                         email của service account vào Shared Drive (quyền Content manager). \
+                         Muốn ghi vào một thư mục cụ thể thì nhập thêm Folder ID.",
+                    )
+                    .small(),
+                );
+            } else {
+                ui.label(
+                    RichText::new(
+                        "Folder ID lấy từ URL drive.google.com/drive/folders/<ID>. Dùng folder có \
+                         sẵn cần quyền Drive đầy đủ; để trống thì app chỉ thấy file nó tạo (an toàn hơn).",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
             ui.checkbox(&mut draft.drive.export_markdown, "Kèm file .md cho từng trang (đọc được trên Drive/điện thoại)");
 
             ui.add_space(8.0);
@@ -65,6 +96,7 @@ pub fn settings(
                 ui.add(egui::DragValue::new(&mut draft.auto_sync_minutes).range(0..=240).suffix(" phút"));
                 ui.label(RichText::new("(0 = tắt)").weak());
             });
+            ui.checkbox(&mut draft.autostart, "Khởi động cùng máy (tự chạy khi đăng nhập)");
             ui.checkbox(&mut draft.markdown, "Hiển thị Markdown (tiêu đề, **đậm**, danh sách, - [ ] checkbox, link)");
             ui.horizontal(|ui| {
                 ui.label("Cỡ chữ");
@@ -104,7 +136,7 @@ pub fn settings(
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("💾 Lưu").clicked() {
-                    result = SettingsResult::Save(draft.clone());
+                    result = SettingsResult::Save(Box::new(draft.clone()));
                 }
                 if ui.button("Huỷ").clicked() {
                     result = SettingsResult::Cancel;

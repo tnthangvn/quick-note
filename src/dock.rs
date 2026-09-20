@@ -17,6 +17,9 @@ use winit::window::WindowLevel;
 
 use crate::config::DockConfig;
 
+/// Whoever hides us keeps sending `SIGUSR1` as a heartbeat; we come back this
+/// long after the last one (tool closed, crashed, or was killed).
+const HIDE_TIMEOUT: Duration = Duration::from_secs(6);
 const ARM_DELAY: Duration = Duration::from_millis(400);
 const RESEND_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -52,6 +55,10 @@ pub struct Dock {
     monitor_names: Vec<String>,
     /// Input region currently set on the X window (window-local physical px).
     input_region: Option<Rect>,
+    /// Whether the window currently accepts keyboard focus.
+    focusable: Option<bool>,
+    /// Hidden on request (see `signals.rs`), and since when.
+    hidden: Option<Instant>,
 }
 
 impl Dock {
@@ -67,12 +74,53 @@ impl Dock {
             workarea: None,
             monitor_names: Vec::new(),
             input_region: None,
+            focusable: None,
+            hidden: None,
         }
     }
 
     pub fn set_config(&mut self, cfg: DockConfig) {
         self.cfg = cfg;
         self.applied = None;
+    }
+
+    /// Hides/shows the whole window (a fullscreen overlay from another app
+    /// would otherwise end up underneath it).
+    pub fn set_hidden(&mut self, ctx: &egui::Context, hidden: bool) {
+        if self.hidden.is_some() == hidden {
+            // Repeated hide = heartbeat: restart the countdown.
+            if hidden {
+                self.hidden = Some(Instant::now());
+            }
+            return;
+        }
+        self.hidden = hidden.then(Instant::now);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(!hidden));
+        if !hidden {
+            self.applied = None;
+            self.input_region = None;
+        }
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.hidden.is_some()
+    }
+
+    /// Comes back on its own if whoever hid us never asked for it back
+    /// (crashed screenshot tool, killed process…).
+    pub fn poll_hidden(&mut self, ctx: &egui::Context) {
+        let Some(since) = self.hidden else { return };
+        match HIDE_TIMEOUT.checked_sub(since.elapsed()) {
+            Some(left) => ctx.request_repaint_after(left),
+            None => self.set_hidden(ctx, false),
+        }
+    }
+
+    /// Opens the panel and keeps it open (tray "show" action).
+    pub fn request_open(&mut self) {
+        self.expanded = true;
+        self.pinned = true;
+        self.left_at = None;
     }
 
     /// Connected monitor names, for the settings dropdown.
@@ -82,6 +130,13 @@ impl Dock {
 
     /// Updates hover state, keeps the OS window placed, and says what to draw.
     pub fn update(&mut self, ctx: &egui::Context, frame: &eframe::Frame) -> DockFrame {
+        if self.hidden.is_some() {
+            // Unmapped: nothing to place, nothing to draw.
+            return DockFrame {
+                view: DockView::Handle,
+                rect: Rect::NOTHING,
+            };
+        }
         self.update_hover(ctx);
         let secs = self.cfg.animation_ms as f32 / 1000.0;
         let t = ctx.animate_bool_with_time_and_easing(
@@ -96,6 +151,12 @@ impl Dock {
         let handle = handle_rect(full, self.cfg.handle_size);
         if let Some(window) = frame.winit_window() {
             self.update_input_region(window, ctx.pixels_per_point(), handle);
+            // While collapsed we are just a sticker: taking keyboard focus would
+            // steal Esc/clicks from whatever is actually in front of the user.
+            let focusable = self.expanded;
+            if self.focusable != Some(focusable) && set_focusable(window, focusable).is_some() {
+                self.focusable = Some(focusable);
+            }
         }
         let view = match t {
             t if t <= 0.0 => DockView::Handle,
@@ -233,6 +294,32 @@ impl Dock {
 
         ctx.request_repaint_after(RESEND_INTERVAL);
     }
+}
+
+/// Tells the window manager whether this window wants keyboard focus (WM_HINTS
+/// input flag). Mutter re-reads it when the property changes.
+fn set_focusable(window: &winit::window::Window, focusable: bool) -> Option<()> {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, PropMode};
+    use x11rb::wrapper::ConnectionExt as _;
+
+    let id = match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Xlib(h) => u32::try_from(h.window).ok()?,
+        RawWindowHandle::Xcb(h) => h.window.get(),
+        _ => return None,
+    };
+    let (conn, _) = x11rb::connect(None).ok()?;
+    let wm_hints = conn.intern_atom(true, b"WM_HINTS").ok()?.reply().ok()?.atom;
+    // ICCCM WM_HINTS: [flags, input, initial_state, ...]; bit 0 of flags = InputHint.
+    let mut hints = [0u32; 9];
+    hints[0] = 1;
+    hints[1] = u32::from(focusable);
+    conn.change_property32(PropMode::REPLACE, id, wm_hints, AtomEnum::WM_HINTS, &hints)
+        .ok()?
+        .check()
+        .ok()?;
+    conn.flush().ok()
 }
 
 /// Sets the X11 input shape of `window` to one rectangle (window-local physical px).

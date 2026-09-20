@@ -16,6 +16,8 @@ const GRIP: f32 = 16.0;
 const GRID_STEP: f32 = 28.0;
 const RADIUS: u8 = 8;
 const ACCENT: Color32 = Color32::from_rgb(255, 138, 0);
+/// Viền sáng sau khi nhảy tới một note qua neo.
+const FLASH_TIME: std::time::Duration = std::time::Duration::from_millis(1600);
 const INK: Color32 = Color32::from_gray(35);
 
 /// Transient UI state that survives between frames but is not persisted.
@@ -26,9 +28,27 @@ pub struct CanvasState {
     /// Note whose Markdown source is open for editing (others show rendered).
     pub editing_body: Option<Uuid>,
     md_cache: CommonMarkCache,
+    /// Đoạn text đang bôi đen trong một note (để tách thành note con).
+    pub selection: Option<Selection>,
+    /// Note vừa được nhảy tới: viền sáng trong chốc lát.
+    pub flash: Option<(Uuid, std::time::Instant)>,
     /// Canvas size from the last frame (for toolbar zoom around the centre).
     pub last_size: Vec2,
     pub links: LinkState,
+}
+
+/// Vùng bôi đen trong phần thân một note, tính theo ký tự.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub note: Uuid,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Selection {
+    pub fn is_empty(&self) -> bool {
+        self.start >= self.end
+    }
 }
 
 pub struct CanvasOptions<'a> {
@@ -51,6 +71,8 @@ struct NoteView {
 #[derive(Default)]
 pub struct CanvasOutput {
     pub changed: bool,
+    /// Tách phần bôi đen của note này thành note con.
+    pub split: Option<Uuid>,
     pub delete: Option<Uuid>,
     pub delete_link: Option<Uuid>,
 }
@@ -59,6 +81,7 @@ pub struct CanvasOutput {
 struct NoteOutput {
     changed: bool,
     delete: bool,
+    split: bool,
 }
 
 pub fn show(
@@ -88,6 +111,12 @@ pub fn show(
     {
         add_note_at_screen(page, canvas, p, state);
         out.changed = true;
+    }
+
+    match state.flash {
+        Some((_, at)) if at.elapsed() >= FLASH_TIME => state.flash = None,
+        Some((_, at)) => ui.ctx().request_repaint_after(FLASH_TIME - at.elapsed()),
+        None => {}
     }
 
     paint_grid(ui, canvas, page.pan, z);
@@ -135,6 +164,9 @@ pub fn show(
         out.changed |= res.changed;
         if res.delete {
             out.delete = Some(note.id);
+        }
+        if res.split {
+            out.split = Some(note.id);
         }
     }
     let under_pointer = ui
@@ -240,7 +272,10 @@ fn note_ui(
 
     // Swallow clicks on the note's padding so notes underneath don't react.
     ui.interact(rect, id.with("block"), Sense::click());
-    paint_note_frame(&ui, rect, zoom, note, matched == Some(true));
+    let flashing = state
+        .flash
+        .is_some_and(|(id, at)| id == note.id && at.elapsed() < FLASH_TIME);
+    paint_note_frame(&ui, rect, zoom, note, matched == Some(true) || flashing);
 
     let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER_H * zoom));
     header_ui(&mut ui, header, view, note, state, &mut out);
@@ -350,6 +385,17 @@ fn header_ui(
     } else {
         "Khoá vị trí & kích thước"
     };
+    let can_split = state
+        .selection
+        .is_some_and(|sel| sel.note == note.id && !sel.is_empty());
+    if bar
+        .add_enabled(can_split, egui::Button::new("»").small())
+        .on_hover_text("Tách phần bôi đen thành note con (Ctrl+Shift+T)")
+        .on_disabled_hover_text("Bôi đen một đoạn trong note để tách")
+        .clicked()
+    {
+        out.split = true;
+    }
     if view.markdown {
         let mut editing = state.editing_body == Some(note.id);
         let tip = if editing {
@@ -412,7 +458,11 @@ fn header_ui(
                 state.editing_title = None;
             }
         } else {
-            let text = RichText::new(note.display_title()).strong().color(INK);
+            let label = match &note.ticket {
+                Some(ticket) => format!("{ticket} · {}", note.display_title()),
+                None => note.display_title().to_string(),
+            };
+            let text = RichText::new(label).strong().color(INK);
             // Non-interactive label so dragging the header still works over the title.
             ui.add(
                 Label::new(text)
@@ -473,15 +523,25 @@ fn edit_body(
     } else {
         "Ghi chú nhanh…"
     };
-    let resp = ui.add(
-        TextEdit::multiline(&mut note.body)
-            .frame(egui::Frame::NONE)
-            .background_color(Color32::TRANSPARENT)
-            .text_color(INK)
-            .hint_text(hint)
-            .desired_width(f32::INFINITY)
-            .min_size(ui.available_size()),
-    );
+    let output = TextEdit::multiline(&mut note.body)
+        .frame(egui::Frame::NONE)
+        .background_color(Color32::TRANSPARENT)
+        .text_color(INK)
+        .hint_text(hint)
+        .desired_width(f32::INFINITY)
+        .min_size(ui.available_size())
+        .show(ui);
+    let resp = &output.response;
+    // Nhớ vùng bôi đen kể cả sau khi ô soạn mất focus (bấm nút ↳ trên thanh note).
+    if let Some(range) = output.cursor_range {
+        let chars = range.as_sorted_char_range();
+        let (start, end) = (chars.start.0, chars.end.0);
+        state.selection = (start < end).then_some(Selection {
+            note: note.id,
+            start,
+            end,
+        });
+    }
     if focus_now {
         resp.request_focus();
         state.focus_body = None;
@@ -512,28 +572,38 @@ fn render_body(ui: &mut Ui, note: &mut Note, state: &mut CanvasState, out: &mut 
 /// Dot on the right edge; drag it onto another note to draw an arrow.
 fn connect_handle(ui: &mut Ui, rect: Rect, zoom: f32, id: Uuid, links: &mut LinkState) {
     let near = ui.rect_contains_pointer(rect.expand(14.0 * zoom));
-    let active = links.connecting == Some(id);
+    let active = links.is_connecting_from(id);
     if !near && !active {
         return;
     }
     let radius = (6.0 * zoom).max(4.0);
-    let centre = egui::pos2(rect.right(), rect.center().y);
-    let hit = Rect::from_center_size(centre, Vec2::splat(radius * 3.0));
-    let resp = ui.interact(hit, ui.id().with("connect"), Sense::drag());
-    if resp.drag_started() {
-        links.connecting = Some(id);
+    // One dot per side, sitting just outside the note so they never cover the
+    // header (which would swallow drags meant to move the note).
+    let out = radius * 0.9;
+    let sides = [
+        ("top", rect.center_top() - vec2(0.0, out)),
+        ("right", rect.right_center() + vec2(out, 0.0)),
+        ("bottom", rect.center_bottom() + vec2(0.0, out)),
+        ("left", rect.left_center() - vec2(out, 0.0)),
+    ];
+    for (side, centre) in sides {
+        let hit = Rect::from_center_size(centre, Vec2::splat(radius * 2.2));
+        let resp = ui.interact(hit, ui.id().with(("connect", side)), Sense::drag());
+        if resp.drag_started() {
+            links.start_connecting(id);
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+        }
+        let resp = resp.on_hover_text("Kéo sang note khác để nối mũi tên");
+        let fill = if resp.hovered() || active {
+            ACCENT
+        } else {
+            Color32::WHITE
+        };
+        ui.painter()
+            .circle(centre, radius, fill, Stroke::new(1.5, ACCENT));
     }
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
-    }
-    let resp = resp.on_hover_text("Kéo sang note khác để nối mũi tên");
-    let fill = if resp.hovered() || active {
-        ACCENT
-    } else {
-        Color32::WHITE
-    };
-    ui.painter()
-        .circle(centre, radius, fill, Stroke::new(1.5, ACCENT));
 }
 
 fn resize_grip(ui: &mut Ui, rect: Rect, zoom: f32, note: &mut Note, out: &mut NoteOutput) {

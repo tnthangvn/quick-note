@@ -21,6 +21,12 @@ pub struct DriveConfig {
     pub folder_name: String,
     /// Also upload each page as a readable Markdown file.
     pub export_markdown: bool,
+    /// Path to a service-account JSON key. When set, it replaces the browser
+    /// login — and `folder_id` must point into a Shared Drive.
+    pub service_account_key: String,
+    /// Email người dùng để service account "đóng vai" (uỷ quyền toàn miền).
+    /// Khi đặt, file do người này sở hữu và nằm trong My Drive của họ.
+    pub impersonate: String,
 }
 
 impl Default for DriveConfig {
@@ -31,16 +37,26 @@ impl Default for DriveConfig {
             folder_id: String::new(),
             folder_name: "QuickNote".into(),
             export_markdown: true,
+            service_account_key: String::new(),
+            impersonate: String::new(),
         }
     }
 }
 
 impl DriveConfig {
+    pub fn uses_service_account(&self) -> bool {
+        !self.service_account_key.trim().is_empty()
+    }
+
     pub fn is_configured(&self) -> bool {
-        !self.client_id.trim().is_empty() && !self.client_secret.trim().is_empty()
+        self.uses_service_account()
+            || (!self.client_id.trim().is_empty() && !self.client_secret.trim().is_empty())
     }
 
     pub fn scope(&self) -> &'static str {
+        if self.uses_service_account() {
+            return "https://www.googleapis.com/auth/drive";
+        }
         if self.folder_id.trim().is_empty() {
             "https://www.googleapis.com/auth/drive.file"
         } else {
@@ -59,6 +75,8 @@ pub struct Config {
     /// Show note bodies as rendered Markdown when not editing.
     pub markdown: bool,
     pub dock: DockConfig,
+    /// Mirrors the XDG autostart entry (see `autostart.rs`).
+    pub autostart: bool,
 }
 
 impl Default for Config {
@@ -69,6 +87,7 @@ impl Default for Config {
             font_size: 15.0,
             markdown: true,
             dock: DockConfig::default(),
+            autostart: false,
         }
     }
 }
@@ -127,6 +146,16 @@ mod tests {
         let mut cfg = DriveConfig::default();
         assert!(cfg.scope().ends_with("drive.file"));
         cfg.folder_id = "abc".into();
+        assert!(cfg.scope().ends_with("/drive"));
+    }
+
+    #[test]
+    fn service_account_key_switches_auth_mode() {
+        let mut cfg = DriveConfig::default();
+        assert!(!cfg.uses_service_account() && !cfg.is_configured());
+        cfg.service_account_key = "/home/me/key.json".into();
+        assert!(cfg.uses_service_account());
+        assert!(cfg.is_configured(), "no client id/secret needed");
         assert!(cfg.scope().ends_with("/drive"));
     }
 

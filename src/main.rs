@@ -1,6 +1,7 @@
 //! Quick Note — sticky-note canvas with pages and Google Drive sync.
 
 mod app;
+mod autostart;
 mod cli;
 mod config;
 #[cfg(debug_assertions)]
@@ -9,7 +10,9 @@ mod dock;
 mod drive;
 mod export;
 mod model;
+mod signals;
 mod storage;
+mod tray;
 mod ui;
 
 use std::sync::Arc;
@@ -39,6 +42,14 @@ fn main() -> eframe::Result {
     }
 
     let dir = storage::app_dir().unwrap_or_else(|e| fail(e));
+    if args.drive_check {
+        let cfg = config::Config::load(&dir).unwrap_or_else(|e| fail(e));
+        match drive::check(&cfg.drive, &dir) {
+            Ok(report) => print!("{report}"),
+            Err(e) => fail(e),
+        }
+        return Ok(());
+    }
     // `--window` opens a normal window for this run even when dock mode is on.
     let dock = config::Config::load(&dir)
         .map(|c| c.dock.enabled && !args.window)

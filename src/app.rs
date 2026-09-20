@@ -6,11 +6,14 @@ use std::time::{Duration, Instant};
 use egui::{Key, KeyboardShortcut, Modifiers};
 use uuid::Uuid;
 
+use crate::autostart;
 use crate::config::Config;
 use crate::dock::{self, Dock, DockFrame, DockView};
 use crate::drive::{Command, DriveHandle, Event};
 use crate::model::{Link, Note, Page, Workspace};
+use crate::signals::{self, SignalCommand};
 use crate::storage;
+use crate::tray::{TrayCommand, TrayHandle};
 use crate::ui::Action;
 use crate::ui::canvas::{self, CanvasState};
 use crate::ui::dialogs::{self, PullChoice, SettingsResult};
@@ -73,6 +76,11 @@ pub struct QuickNoteApp {
     pending_pull: Option<Workspace>,
     /// Some = corner-sticky mode (see `dock.rs`).
     dock: Option<Dock>,
+    /// None when the desktop shows no tray.
+    tray: Option<TrayHandle>,
+    /// Tray commands waiting for a frame that draws the full UI.
+    queued: Vec<Action>,
+    signals: std::sync::mpsc::Receiver<SignalCommand>,
 }
 
 impl QuickNoteApp {
@@ -90,6 +98,14 @@ impl QuickNoteApp {
             Workspace::default()
         });
         let cfg = Config::load(&dir).unwrap_or_default();
+        // Keep the autostart entry in sync with the saved setting (e.g. after a
+        // reinstall moved the binary); skip the write when it already matches.
+        if cfg.autostart != autostart::is_enabled()
+            && let Err(e) = autostart::set(cfg.autostart)
+        {
+            eprintln!("quick-note: autostart: {e:#}");
+        }
+        let notes = ws.active_page().notes.len();
         apply_font_size(&cc.egui_ctx, cfg.font_size);
         // Ctrl +/-/0 zoom the canvas, not the whole UI.
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
@@ -116,6 +132,9 @@ impl QuickNoteApp {
             settings_draft: None,
             pending_pull: None,
             dock: dock_mode.then(|| Dock::new(cfg.dock.clone())),
+            tray: TrayHandle::spawn(cc.egui_ctx.clone(), cfg.autostart, notes),
+            queued: Vec::new(),
+            signals: signals::listen(cc.egui_ctx.clone()),
             cfg,
         }
     }
@@ -133,6 +152,9 @@ impl QuickNoteApp {
         self.dirty_since.get_or_insert_with(Instant::now);
         self.unsynced = true;
         self.edit_gen += 1;
+        if let Some(tray) = &self.tray {
+            tray.set_note_count(self.ws.active_page().notes.len());
+        }
     }
 
     fn save_now(&mut self) {
@@ -221,6 +243,14 @@ impl QuickNoteApp {
                 }
             }
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Action::ShowPanel => {
+                if let Some(dock) = self.dock.as_mut() {
+                    dock.request_open();
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            Action::SetAutostart(on) => self.set_autostart(on),
+            Action::SplitSelection(note) => self.split_selection(note),
             Action::OpenSettings => self.settings_draft = Some(self.cfg.clone()),
             Action::ExportMarkdown => {
                 match storage::export_markdown(&self.dir, self.ws.active_page()) {
@@ -242,6 +272,144 @@ impl QuickNoteApp {
                 links,
             });
             self.mark_changed();
+        }
+    }
+
+    /// Cắt phần bôi đen khỏi note cha, tạo note con mang mã ticket, và để lại
+    /// một neo bấm được ở đúng chỗ vừa cắt.
+    fn split_selection(&mut self, parent: Uuid) {
+        let Some(sel) = self
+            .canvas
+            .selection
+            .filter(|s| s.note == parent && !s.is_empty())
+        else {
+            self.notify("Bôi đen một đoạn trong note rồi bấm »", true);
+            return;
+        };
+        let page_idx = self.ws.active;
+        let Some(note) = self.ws.pages[page_idx]
+            .notes
+            .iter()
+            .find(|n| n.id == parent)
+        else {
+            return;
+        };
+        let Some(text) = char_slice(&note.body, sel.start, sel.end) else {
+            return;
+        };
+        if text.trim().is_empty() {
+            self.notify("Đoạn bôi đen không có nội dung", true);
+            return;
+        }
+        let prefix = self.ws.ticket_prefix_for_child(note);
+        let ticket = self.ws.next_ticket(&prefix);
+
+        let page = &mut self.ws.pages[page_idx];
+        let Some(child) = page.split_note(parent, &text, ticket.clone()) else {
+            return;
+        };
+        let title = page
+            .notes
+            .iter()
+            .find(|n| n.id == child)
+            .map(|n| n.display_title().to_string())
+            .unwrap_or_default();
+        let anchor = format!("[» {ticket} {title}](quicknote://note/{child})");
+        if let Some(note) = page.notes.iter_mut().find(|n| n.id == parent) {
+            replace_char_range(&mut note.body, sel.start, sel.end, &anchor);
+            note.updated_at = crate::model::now_ts();
+        }
+        self.canvas.selection = None;
+        self.canvas.flash = Some((child, Instant::now()));
+        self.notify(format!("Đã tách thành {ticket}"), false);
+        self.mark_changed();
+    }
+
+    /// Chuyển khung nhìn tới một note (dùng khi bấm neo).
+    fn focus_note(&mut self, id: Uuid) {
+        let Some(page_idx) = self
+            .ws
+            .pages
+            .iter()
+            .position(|p| p.notes.iter().any(|n| n.id == id))
+        else {
+            self.notify("Không tìm thấy note của neo này", true);
+            return;
+        };
+        self.ws.active = page_idx;
+        let view = self.canvas.last_size;
+        let page = &mut self.ws.pages[page_idx];
+        if let Some(note) = page.notes.iter().find(|n| n.id == id) {
+            let (pos, size, zoom) = (note.pos, note.size, page.zoom);
+            page.pan = [
+                view.x / 2.0 - (pos[0] + size[0] / 2.0) * zoom,
+                view.y / 2.0 - (pos[1] + size[1] / 2.0) * zoom,
+            ];
+        }
+        page.bring_to_front(id);
+        self.canvas.flash = Some((id, Instant::now()));
+        self.dirty_since.get_or_insert_with(Instant::now);
+    }
+
+    fn set_autostart(&mut self, enabled: bool) {
+        match autostart::set(enabled) {
+            Ok(()) => {
+                self.cfg.autostart = enabled;
+                if let Err(e) = self.cfg.save(&self.dir) {
+                    self.notify(format!("Lỗi lưu cài đặt: {e:#}"), true);
+                }
+                if let Some(tray) = &self.tray {
+                    tray.set_autostart(enabled);
+                }
+                let msg = if enabled {
+                    "Sẽ tự chạy khi đăng nhập"
+                } else {
+                    "Đã tắt tự khởi động"
+                };
+                self.notify(msg, false);
+            }
+            Err(e) => self.notify(format!("Lỗi tự khởi động: {e:#}"), true),
+        }
+    }
+
+    /// `pkill -USR1 quick-note` hides the window (see `signals.rs`), `-USR2` shows it.
+    fn handle_signals(&mut self, ctx: &egui::Context) {
+        let commands: Vec<_> = self.signals.try_iter().collect();
+        for cmd in commands {
+            match (&mut self.dock, cmd) {
+                (Some(dock), SignalCommand::Hide) => dock.set_hidden(ctx, true),
+                (Some(dock), SignalCommand::Show) => dock.set_hidden(ctx, false),
+                (None, SignalCommand::Hide) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false))
+                }
+                (None, SignalCommand::Show) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true))
+                }
+            }
+        }
+    }
+
+    /// Tray runs on its own thread; its commands are applied on the next full frame.
+    fn handle_tray(&mut self, ctx: &egui::Context) {
+        let Some(tray) = &self.tray else { return };
+        for cmd in tray.poll() {
+            let action = match cmd {
+                TrayCommand::Open => Action::ShowPanel,
+                TrayCommand::NewNote => Action::AddNote,
+                TrayCommand::Sync => Action::Push,
+                TrayCommand::Settings => Action::OpenSettings,
+                TrayCommand::SetAutostart(on) => Action::SetAutostart(on),
+                TrayCommand::Quit => {
+                    self.save_now();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    continue;
+                }
+            };
+            if let Some(dock) = self.dock.as_mut() {
+                dock.set_hidden(&ctx.clone(), false);
+                dock.request_open(); // the panel must be visible to act on it
+            }
+            self.queued.push(action);
         }
     }
 
@@ -318,6 +486,10 @@ impl QuickNoteApp {
         for event in self.drive.poll() {
             match event {
                 Event::Busy(msg) => self.drive_state.busy = Some(msg),
+                Event::Info(msg) => {
+                    self.drive_state.busy = None;
+                    self.notify(msg, false);
+                }
                 Event::LoggedIn => {
                     self.drive_state.busy = None;
                     self.drive_state.connected = true;
@@ -367,6 +539,12 @@ impl QuickNoteApp {
             }
             if i.consume_shortcut(&cmd(Key::Num0)) {
                 actions.push(Action::ZoomReset);
+            }
+            let split = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::T);
+            if i.consume_shortcut(&split)
+                && let Some(sel) = self.canvas.selection
+            {
+                actions.push(Action::SplitSelection(sel.note));
             }
             if i.consume_shortcut(&cmd(Key::Q)) {
                 actions.push(Action::Quit);
@@ -435,6 +613,10 @@ impl QuickNoteApp {
                     self.settings_draft = None;
                 }
                 SettingsResult::Save(cfg) => {
+                    let cfg = *cfg;
+                    if cfg.autostart != self.cfg.autostart {
+                        self.set_autostart(cfg.autostart);
+                    }
                     match cfg.save(&self.dir) {
                         Ok(()) => self.notify("Đã lưu cài đặt", false),
                         Err(e) => self.notify(format!("Lỗi lưu cài đặt: {e:#}"), true),
@@ -497,10 +679,17 @@ impl eframe::App for QuickNoteApp {
         #[cfg(debug_assertions)]
         crate::debug_shot::tick(&ctx);
         self.handle_drive_events();
+        self.handle_tray(&ctx);
+        self.handle_signals(&ctx);
 
         if let Some(dock) = self.dock.as_mut() {
             let DockFrame { view, rect } = dock.update(&ctx, frame);
             self.toolbar.dock_pinned = Some(dock.pinned);
+            if dock.is_hidden() {
+                dock.poll_hidden(&ctx);
+                self.background_tasks(&ctx);
+                return;
+            }
             if view != DockView::Panel {
                 // Everything outside `rect` stays transparent (see `clear_color`).
                 let count = self.ws.active_page().notes.len();
@@ -513,7 +702,7 @@ impl eframe::App for QuickNoteApp {
             }
         }
 
-        let mut actions = Vec::new();
+        let mut actions = std::mem::take(&mut self.queued);
         self.shortcuts(&ctx, &mut actions);
 
         let drive_view = DriveView {
@@ -541,6 +730,7 @@ impl eframe::App for QuickNoteApp {
 
         let mut delete = None;
         let mut delete_link = None;
+        let mut split = None;
         let canvas_frame = egui::Frame::central_panel(ui.style()).inner_margin(0);
         egui::CentralPanel::default()
             .frame(canvas_frame)
@@ -553,6 +743,7 @@ impl eframe::App for QuickNoteApp {
                 let out = canvas::show(ui, self.ws.active_page_mut(), &mut self.canvas, &opts);
                 delete = out.delete;
                 delete_link = out.delete_link;
+                split = out.split;
                 if out.changed {
                     self.mark_changed();
                 }
@@ -563,11 +754,24 @@ impl eframe::App for QuickNoteApp {
         if let Some(id) = delete_link {
             self.delete_link(id);
         }
+        if let Some(id) = split {
+            self.split_selection(id);
+        }
 
         for action in actions {
             self.apply(action, &ctx);
         }
         self.dialogs(&ctx);
+        for url in take_clicked_links(&ctx) {
+            match note_anchor(&url) {
+                Some(id) => self.focus_note(id),
+                None => {
+                    if let Err(e) = webbrowser::open(&url) {
+                        eprintln!("quick-note: không mở được {url}: {e}");
+                    }
+                }
+            }
+        }
         self.background_tasks(&ctx);
     }
 
@@ -584,6 +788,50 @@ impl eframe::App for QuickNoteApp {
             self.save_now();
         }
     }
+}
+
+/// Neo nội bộ: `quicknote://note/<uuid>`.
+pub const ANCHOR_SCHEME: &str = "quicknote://note/";
+
+fn note_anchor(url: &str) -> Option<Uuid> {
+    Uuid::parse_str(url.strip_prefix(ANCHOR_SCHEME)?).ok()
+}
+
+/// Cắt chuỗi theo chỉ số ký tự (không phải byte).
+fn char_slice(text: &str, start: usize, end: usize) -> Option<String> {
+    let mut chars = text.char_indices().map(|(i, _)| i).chain([text.len()]);
+    let from = chars.clone().nth(start)?;
+    let to = chars.nth(end)?;
+    text.get(from..to).map(str::to_string)
+}
+
+fn replace_char_range(text: &mut String, start: usize, end: usize, with: &str) {
+    let offsets: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain([text.len()])
+        .collect();
+    let (Some(&from), Some(&to)) = (offsets.get(start), offsets.get(end)) else {
+        return;
+    };
+    text.replace_range(from..to, with);
+}
+
+/// Native eframe ignores `OpenUrl` commands (only the web build handles them),
+/// so hyperlinks do nothing unless we open them ourselves.
+fn take_clicked_links(ctx: &egui::Context) -> Vec<String> {
+    let urls: Vec<String> = ctx.output_mut(|o| {
+        let mut urls = Vec::new();
+        o.commands.retain(|cmd| match cmd {
+            egui::OutputCommand::OpenUrl(open) => {
+                urls.push(open.url.clone());
+                false
+            }
+            _ => true,
+        });
+        urls
+    });
+    urls
 }
 
 fn apply_font_size(ctx: &egui::Context, size: f32) {
@@ -610,4 +858,40 @@ fn apply_font_size(ctx: &egui::Context, size: f32) {
         ]
         .into();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn char_slice_handles_multibyte_text() {
+        let text = "đơn đội step 2";
+        assert_eq!(char_slice(text, 0, 3).unwrap(), "đơn");
+        assert_eq!(char_slice(text, 4, 7).unwrap(), "đội");
+        assert_eq!(char_slice(text, 0, 14).unwrap(), text);
+        assert!(char_slice(text, 0, 99).is_none());
+    }
+
+    #[test]
+    fn replace_char_range_keeps_the_rest_intact() {
+        let mut text = String::from("update độ tuổi\nđơn đội");
+        replace_char_range(&mut text, 15, 22, "[neo]");
+        assert_eq!(text, "update độ tuổi\n[neo]");
+
+        let mut text = String::from("abc");
+        replace_char_range(&mut text, 5, 9, "x");
+        assert_eq!(text, "abc", "chỉ số ngoài phạm vi thì bỏ qua");
+    }
+
+    #[test]
+    fn note_anchor_parses_only_internal_links() {
+        let id = Uuid::new_v4();
+        assert_eq!(note_anchor(&format!("{ANCHOR_SCHEME}{id}")), Some(id));
+        assert_eq!(note_anchor("https://docs.rs/egui"), None);
+        assert_eq!(
+            note_anchor(&format!("{ANCHOR_SCHEME}không-phải-uuid")),
+            None
+        );
+    }
 }

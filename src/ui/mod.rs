@@ -25,4 +25,9 @@ pub enum Action {
     ExportMarkdown,
     ToggleDockPin,
     Quit,
+    /// Show the panel and keep it open (from the tray).
+    ShowPanel,
+    SetAutostart(bool),
+    /// Tách phần bôi đen của note này thành note con.
+    SplitSelection(uuid::Uuid),
 }

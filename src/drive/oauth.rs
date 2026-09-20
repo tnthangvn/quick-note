@@ -213,7 +213,7 @@ fn is_invalid_grant(body: &str) -> bool {
 }
 
 /// Extracts a short error description without echoing tokens back.
-fn google_error(body: &str) -> String {
+pub(super) fn google_error(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| {

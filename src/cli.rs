@@ -14,6 +14,7 @@ Tuỳ chọn:
   -h, --help        Hiện trợ giúp này
   -V, --version     Hiện phiên bản
   -w, --window      Mở dạng cửa sổ thường (bỏ qua chế độ sticky góc màn hình)
+      --drive-check Kiểm tra cấu hình Google Drive (chỉ đọc, không ghi gì)
       --uninstall   Gỡ app đã cài bằng scripts/install.sh (giữ lại ghi chú)
       --purge       Dùng kèm --uninstall: xoá luôn ghi chú + cài đặt (có hỏi xác nhận)
 
@@ -26,6 +27,7 @@ pub struct Args {
     pub version: bool,
     pub window: bool,
     pub uninstall: bool,
+    pub drive_check: bool,
     pub purge: bool,
 }
 
@@ -37,6 +39,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "-V" | "--version" => out.version = true,
             "-w" | "--window" => out.window = true,
             "--uninstall" => out.uninstall = true,
+            "--drive-check" => out.drive_check = true,
             "--purge" => out.purge = true,
             other => bail!(
                 "tuỳ chọn không hợp lệ: {other}\nChạy `quick-note --help` để xem các tuỳ chọn."
@@ -124,6 +127,11 @@ mod tests {
         assert!(p(&["-w"]).unwrap().window);
         let a = p(&["--uninstall", "--purge"]).unwrap();
         assert!(a.uninstall && a.purge);
+    }
+
+    #[test]
+    fn parses_drive_check() {
+        assert!(p(&["--drive-check"]).unwrap().drive_check);
     }
 
     #[test]
