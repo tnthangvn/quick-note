@@ -7,6 +7,8 @@ App ghi chú nhanh dạng sticky note cho Ubuntu 24.04 / 26.04 (Wayland và X11)
 - Note có màu, tiêu đề, khoá vị trí (📌), tìm kiếm (note không khớp bị làm mờ)
 - **Markdown**: note hiển thị dạng đã render (tiêu đề, **đậm**, *nghiêng*, danh sách, `- [ ]` checkbox tick được, link bấm mở trình duyệt, `code`, trích dẫn). Nhấp đúp hoặc bấm ✏ để sửa, Esc/click ra ngoài để xem lại. Tắt được trong Cài đặt
 - **Tách thành việc con**: bôi đen một đoạn trong note → bấm **»** trên thanh note (hoặc Ctrl+Shift+T). Đoạn đó thành note con riêng, được cấp mã ticket theo tên note cha (`RV` → `RV-1`, `RV-2`…), nối mũi tên cha → con, và chỗ vừa cắt để lại neo `» RV-1 tiêu đề` bấm vào là nhảy tới note con (note đó sáng viền trong 1,6 giây). Note con tách tiếp thì nối tiếp mã của cha
+- **Ô soạn thảo tô định dạng**: gõ Markdown thô nhưng hiện đúng kiểu — tiêu đề to, `code` nền xám, *nghiêng*, link xanh, dấu đầu dòng nổi bật. Enter ở cuối một mục danh sách tự thêm dấu đầu dòng mới (`- `, `- [ ] `, `4. `), mục rỗng thì Enter để thoát danh sách
+- **Dán ảnh**: Ctrl+V khi đang sửa note. App thử lần lượt: bitmap trong clipboard → `wl-paste --type image/png` → đường dẫn file ảnh (`text/uri-list`) → thẻ `<img src>` trong `text/html` (kể cả `data:` base64 và tải qua HTTP). Ảnh lưu ở `~/.config/quick-note/attachments/`, chèn vào note dạng `![ảnh](file://…)`, hiển thị ngay ở chế độ xem. Đồng bộ Drive đẩy kèm các ảnh này. Gỡ lỗi: `quick-note --clipboard-check`
 - **Sơ đồ**: rê chuột vào note → 4 chấm tròn hiện ở 4 cạnh (trên/dưới/trái/phải), kéo chấm nào cũng được, thả vào note khác để nối mũi tên. Mũi tên mặc định nét đứt và dấu gạch chạy theo hướng mũi tên. Click chọn + Delete để xoá; chuột phải để đặt nhãn, tắt nét đứt, đổi chiều. Mũi tên bám theo khi kéo note; xoá note thì Ctrl+Z khôi phục cả mũi tên. File `.md` xuất ra có mục "Liên kết"
 - **Zoom** canvas 30%–300%: Ctrl+cuộn chuột (zoom quanh con trỏ), Ctrl+= / Ctrl+- / Ctrl+0, hoặc nút − % + trên thanh công cụ; mỗi trang nhớ mức zoom riêng
 - Tự lưu local sau mỗi lần sửa (debounce 0,8s), ghi file atomic
@@ -136,6 +138,7 @@ Không cần đăng nhập trình duyệt, không hết hạn token:
 - `config.json` — cài đặt (quyền 600, chứa client secret)
 - `drive_token.json` — refresh token (quyền 600)
 - `backups/` — bản sao trước mỗi lần thay bằng bản Drive
+- `attachments/` — ảnh dán vào note
 
 ## Phát triển
 
@@ -144,6 +147,8 @@ cargo run
 cargo test
 cargo clippy --all-targets -- -D warnings
 QUICK_NOTE_SCREENSHOT=/tmp/shot.ppm cargo run   # build debug: chụp 1 frame rồi thoát
+QUICK_NOTE_SCREENSHOT_FRAME=400 …              # chụp ở khung hình muộn hơn (xem animation)
+QUICK_NOTE_EDIT_FIRST=1 …                      # mở sẵn note đầu ở chế độ sửa
 ```
 
 ```
@@ -155,6 +160,7 @@ src/
 ├── config.rs        cài đặt
 ├── tray.rs          biểu tượng + menu khay hệ thống (D-Bus)
 ├── autostart.rs     khởi động cùng máy (XDG autostart)
+├── attach.rs        dán ảnh từ clipboard, lưu PNG, chèn Markdown
 ├── signals.rs       SIGUSR1/SIGUSR2 để ẩn/hiện cửa sổ
 ├── dock.rs          chế độ sticky góc màn hình (XWayland, animation)
 ├── export.rs        Markdown

@@ -9,6 +9,7 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use uuid::Uuid;
 
 use super::links::{self, LinkState};
+use super::md_highlight;
 use crate::model::{MIN_NOTE_SIZE, NOTE_COLORS, Note, Page, ZOOM_STEP, now_ts};
 
 const HEADER_H: f32 = 28.0;
@@ -19,6 +20,26 @@ const ACCENT: Color32 = Color32::from_rgb(255, 138, 0);
 /// Viền sáng sau khi nhảy tới một note qua neo.
 const FLASH_TIME: std::time::Duration = std::time::Duration::from_millis(1600);
 const INK: Color32 = Color32::from_gray(35);
+
+/// Id của ô soạn nội dung note — cần cố định để đọc lại vùng bôi đen.
+fn body_id(note: Uuid) -> Id {
+    Id::new(("note-body", note))
+}
+
+/// Vị trí con trỏ (theo ký tự) trong phần nội dung của note.
+pub fn cursor_index(ctx: &egui::Context, note: Uuid) -> Option<usize> {
+    let state = egui::TextEdit::load_state(ctx, body_id(note))?;
+    Some(state.cursor.char_range()?.primary.index.0)
+}
+
+/// Vùng bôi đen hiện tại trong note, đọc thẳng từ trạng thái ô soạn thảo.
+/// Không phụ thuộc thứ tự vẽ, và còn nguyên khi ô mất focus.
+pub fn selected_range(ctx: &egui::Context, note: Uuid) -> Option<Selection> {
+    let state = egui::TextEdit::load_state(ctx, body_id(note))?;
+    let chars = state.cursor.char_range()?.as_sorted_char_range();
+    let (start, end) = (chars.start.0, chars.end.0);
+    (start < end).then_some(Selection { note, start, end })
+}
 
 /// Transient UI state that survives between frames but is not persisted.
 #[derive(Default)]
@@ -64,13 +85,13 @@ struct NoteView {
     /// `Some(false)` = a search is active and this note doesn't match.
     matched: Option<bool>,
     markdown: bool,
-    /// The user double-clicked this note (and it was the topmost one there).
-    double_clicked: bool,
 }
 
 #[derive(Default)]
 pub struct CanvasOutput {
     pub changed: bool,
+    /// Dán ảnh từ clipboard vào note này.
+    pub paste_image: Option<Uuid>,
     /// Tách phần bôi đen của note này thành note con.
     pub split: Option<Uuid>,
     pub delete: Option<Uuid>,
@@ -82,6 +103,9 @@ struct NoteOutput {
     changed: bool,
     delete: bool,
     split: bool,
+    paste_image: bool,
+    /// Chuyển note sang chế độ sửa (để bôi đen được).
+    edit: bool,
 }
 
 pub fn show(
@@ -138,15 +162,16 @@ pub fn show(
         out.changed = true;
     }
 
+    // Nhớ vùng bôi đen gần nhất: khi bấm nút », ô soạn thảo xử lý cú nhấn
+    // trước và xoá vùng chọn, nên không thể đọc "sống" tại thời điểm đó.
+    if let Some(sel) = state
+        .editing_body
+        .and_then(|id| selected_range(ui.ctx(), id))
+    {
+        state.selection = Some(sel);
+    }
+
     let raise = topmost_pressed(ui, page, origin);
-    let double_clicked = ui
-        .input(|i| {
-            i.pointer
-                .button_double_clicked(egui::PointerButton::Primary)
-                .then(|| i.pointer.interact_pos())
-                .flatten()
-        })
-        .and_then(|pos| topmost_at(page, origin, pos));
     let query = opts.search.trim();
     for note in page.notes.iter_mut() {
         let rect = note_rect(note, origin, z);
@@ -158,7 +183,6 @@ pub fn show(
             zoom: z,
             matched: (!query.is_empty()).then(|| note.matches(query)),
             markdown: opts.markdown,
-            double_clicked: double_clicked == Some(note.id),
         };
         let res = note_ui(ui, canvas, &view, note, state);
         out.changed |= res.changed;
@@ -167,6 +191,13 @@ pub fn show(
         }
         if res.split {
             out.split = Some(note.id);
+        }
+        if res.paste_image {
+            out.paste_image = Some(note.id);
+        }
+        if res.edit {
+            state.editing_body = Some(note.id);
+            state.focus_body = Some(note.id);
         }
     }
     let under_pointer = ui
@@ -385,16 +416,22 @@ fn header_ui(
     } else {
         "Khoá vị trí & kích thước"
     };
-    let can_split = state
-        .selection
-        .is_some_and(|sel| sel.note == note.id && !sel.is_empty());
-    if bar
-        .add_enabled(can_split, egui::Button::new("»").small())
-        .on_hover_text("Tách phần bôi đen thành note con (Ctrl+Shift+T)")
-        .on_disabled_hover_text("Bôi đen một đoạn trong note để tách")
-        .clicked()
-    {
-        out.split = true;
+    // Ở chế độ xem thì chưa bôi đen được: bấm » lần đầu để mở chế độ sửa.
+    let can_split = selected_range(ui.ctx(), note.id).is_some();
+    let editing_now = state.editing_body == Some(note.id) || !view.markdown;
+    let tip = if can_split {
+        "Tách phần bôi đen thành note con (Ctrl+Shift+T)"
+    } else if editing_now {
+        "Bôi đen một đoạn trong note rồi bấm nút này"
+    } else {
+        "Mở chế độ sửa để bôi đen và tách"
+    };
+    if bar.small_button("»").on_hover_text(tip).clicked() {
+        if can_split {
+            out.split = true;
+        } else {
+            out.edit = true;
+        }
     }
     if view.markdown {
         let mut editing = state.editing_body == Some(note.id);
@@ -483,9 +520,19 @@ fn body_ui(
     state: &mut CanvasState,
     out: &mut NoteOutput,
 ) {
-    if view.markdown && view.double_clicked && ui.rect_contains_pointer(body) {
-        state.editing_body = Some(note.id);
-        state.focus_body = Some(note.id);
+    let editing_before = !view.markdown || state.editing_body == Some(note.id);
+    // Đăng ký TRƯỚC phần nội dung: link và checkbox vẽ sau nên vẫn bắt được
+    // cú nhấn của chúng, phần nền còn lại thì mở chế độ sửa.
+    let background = (!editing_before)
+        .then(|| ui.interact(body, Id::new(("body-click", note.id)), Sense::click()));
+    if let Some(resp) = &background {
+        if resp.clicked() || resp.double_clicked() {
+            state.editing_body = Some(note.id);
+            state.focus_body = Some(note.id);
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Text);
+        }
     }
     let focus_now = state.focus_body == Some(note.id);
     if focus_now && view.markdown {
@@ -523,7 +570,13 @@ fn edit_body(
     } else {
         "Ghi chú nhanh…"
     };
+    let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, wrap: f32| {
+        let job = md_highlight::layout(ui, text.as_str(), wrap, INK);
+        ui.fonts_mut(|f| f.layout_job(job))
+    };
     let output = TextEdit::multiline(&mut note.body)
+        .id(body_id(note.id))
+        .layouter(&mut layouter)
         .frame(egui::Frame::NONE)
         .background_color(Color32::TRANSPARENT)
         .text_color(INK)
@@ -532,16 +585,6 @@ fn edit_body(
         .min_size(ui.available_size())
         .show(ui);
     let resp = &output.response;
-    // Nhớ vùng bôi đen kể cả sau khi ô soạn mất focus (bấm nút ↳ trên thanh note).
-    if let Some(range) = output.cursor_range {
-        let chars = range.as_sorted_char_range();
-        let (start, end) = (chars.start.0, chars.end.0);
-        state.selection = (start < end).then_some(Selection {
-            note: note.id,
-            start,
-            end,
-        });
-    }
     if focus_now {
         resp.request_focus();
         state.focus_body = None;
@@ -550,10 +593,97 @@ fn edit_body(
         note.updated_at = now_ts();
         out.changed = true;
     }
+    if resp.has_focus() {
+        continue_list(ui, note, &output, out);
+        // Ctrl+V: ô soạn thảo tự dán chữ. Không "ăn" phím tắt ở đây — chỉ báo
+        // cho app kiểm tra xem clipboard có ảnh không.
+        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
+            out.paste_image = true;
+        }
+    }
+    if split_button(ui, &output, note.id, state.selection) {
+        out.split = true;
+    }
     // Click elsewhere or Esc: back to the rendered view.
     if markdown && resp.lost_focus() && state.editing_body == Some(note.id) {
         state.editing_body = None;
     }
+}
+
+/// Bấm Enter ở cuối một mục danh sách thì tự thêm dấu đầu dòng cho dòng mới.
+fn continue_list(
+    ui: &Ui,
+    note: &mut Note,
+    output: &egui::text_edit::TextEditOutput,
+    out: &mut NoteOutput,
+) {
+    if !ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        return;
+    }
+    let Some(range) = output.cursor_range else {
+        return;
+    };
+    let at = range.primary.index.0;
+    // Con trỏ vừa xuống dòng: dòng phía trên là mục vừa gõ xong.
+    let before: String = note.body.chars().take(at).collect();
+    let Some(previous) = before.trim_end_matches('\n').rsplit('\n').next() else {
+        return;
+    };
+    let Some(marker) = md_highlight::continued_marker(previous) else {
+        return;
+    };
+    let byte = before.len();
+    note.body.insert_str(byte, &marker);
+    note.updated_at = now_ts();
+    out.changed = true;
+
+    let cursor = egui::text::CCursor::new(at + marker.chars().count());
+    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), body_id(note.id)) {
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(cursor)));
+        state.store(ui.ctx(), body_id(note.id));
+    }
+}
+
+/// Nút tròn nổi ngay sau đoạn bôi đen: bấm là tách thành note con.
+fn split_button(
+    ui: &mut Ui,
+    output: &egui::text_edit::TextEditOutput,
+    note: Uuid,
+    remembered: Option<Selection>,
+) -> bool {
+    let live = output
+        .cursor_range
+        .map(|r| r.as_sorted_char_range())
+        .filter(|r| r.start < r.end)
+        .map(|r| r.end.0);
+    // Sau cú nhấn, vùng chọn "sống" biến mất — vẫn giữ nút ở chỗ cũ.
+    let Some(end) = live.or_else(|| remembered.filter(|s| s.note == note).map(|s| s.end)) else {
+        return false;
+    };
+    let caret = output.galley.pos_from_cursor(egui::text::CCursor::new(end));
+    let centre = output.galley_pos + caret.right_center().to_vec2() + vec2(12.0, 0.0);
+    let rect = Rect::from_center_size(centre, Vec2::splat(20.0));
+
+    let resp = ui
+        .interact(rect, Id::new(("split-btn", note)), Sense::click())
+        .on_hover_text("Tách đoạn này thành note con (Ctrl+Shift+T)");
+    let fill = if resp.hovered() {
+        ACCENT
+    } else {
+        ACCENT.gamma_multiply(0.75)
+    };
+    let painter = ui.painter();
+    painter.circle(rect.center(), 10.0, fill, Stroke::new(1.0, INK));
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "»",
+        egui::FontId::proportional(13.0),
+        Color32::WHITE,
+    );
+    resp.clicked()
 }
 
 fn render_body(ui: &mut Ui, note: &mut Note, state: &mut CanvasState, out: &mut NoteOutput) {

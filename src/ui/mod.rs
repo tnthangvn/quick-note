@@ -4,6 +4,7 @@
 pub mod canvas;
 pub mod dialogs;
 pub mod links;
+pub mod md_highlight;
 pub mod toolbar;
 
 pub enum Action {

@@ -176,6 +176,38 @@ fn parse_ticket(ticket: &str) -> Option<(&str, u32)> {
     Some((prefix, number.parse().ok()?))
 }
 
+/// Neo nội bộ trong nội dung note: `[nhãn](quicknote://note/<id>)`.
+pub const ANCHOR_SCHEME: &str = "quicknote://note/";
+
+/// Bỏ neo trỏ tới `note`, giữ lại phần chữ của nhãn (bỏ `» ` và mã ticket).
+pub fn strip_anchors(body: &str, note: Uuid) -> String {
+    let needle = format!("]({ANCHOR_SCHEME}{note})");
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(at) = rest.find(&needle) {
+        let (before, after) = rest.split_at(at);
+        let Some(open) = before.rfind('[') else {
+            out.push_str(&rest[..at + needle.len()]);
+            rest = &after[needle.len()..];
+            continue;
+        };
+        out.push_str(&before[..open]);
+        out.push_str(&anchor_text(&before[open + 1..]));
+        rest = &after[needle.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// "» RV-1 update độ tuổi" → "update độ tuổi".
+fn anchor_text(label: &str) -> String {
+    let label = label.trim_start_matches('»').trim_start();
+    match label.split_once(' ') {
+        Some((first, rest)) if parse_ticket(first).is_some() => rest.to_string(),
+        _ => label.to_string(),
+    }
+}
+
 pub const ZOOM_MIN: f32 = 0.3;
 pub const ZOOM_MAX: f32 = 3.0;
 pub const ZOOM_STEP: f32 = 1.15;
@@ -261,6 +293,19 @@ impl Page {
         child.body = body.trim_start().to_string();
         self.connect(parent, id);
         Some(id)
+    }
+
+    /// Đổi mọi neo trỏ tới `note` thành chữ thường (dùng khi xoá note đó).
+    /// Trả về (id note, nội dung cũ) để hoàn tác.
+    pub fn unlink_anchors(&mut self, note: Uuid) -> Vec<(Uuid, String)> {
+        let mut changed = Vec::new();
+        for other in self.notes.iter_mut().filter(|n| n.id != note) {
+            let stripped = strip_anchors(&other.body, note);
+            if stripped != other.body {
+                changed.push((other.id, std::mem::replace(&mut other.body, stripped)));
+            }
+        }
+        changed
     }
 
     pub fn remove_link(&mut self, id: Uuid) -> Option<Link> {
@@ -594,6 +639,48 @@ mod tests {
             page.split_note(Uuid::new_v4(), "x", "RV-1".into())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn strip_anchors_giu_lai_chu_bo_ma_ticket() {
+        let id = Uuid::new_v4();
+        let body = format!("xong rồi\n[» RV-1 update độ tuổi]({ANCHOR_SCHEME}{id}) nhé");
+        assert_eq!(strip_anchors(&body, id), "xong rồi\nupdate độ tuổi nhé");
+    }
+
+    #[test]
+    fn strip_anchors_bo_qua_neo_cua_note_khac() {
+        let (id, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let body = format!("[» RV-1 a]({ANCHOR_SCHEME}{other}) và [» RV-2 b]({ANCHOR_SCHEME}{id})");
+        let out = strip_anchors(&body, id);
+        assert!(
+            out.contains(&other.to_string()),
+            "neo của note khác còn nguyên"
+        );
+        assert!(out.ends_with(" và b"));
+        assert!(!out.contains(&id.to_string()));
+    }
+
+    #[test]
+    fn strip_anchors_giu_nguyen_link_thuong() {
+        let id = Uuid::new_v4();
+        let body = "xem [egui](https://docs.rs/egui)";
+        assert_eq!(strip_anchors(body, id), body);
+    }
+
+    #[test]
+    fn unlink_anchors_tra_ve_noi_dung_cu_de_hoan_tac() {
+        let mut page = Page::new("p");
+        let parent = page.add_note([0.0, 0.0]);
+        let child = page.split_note(parent, "việc con", "RV-1".into()).unwrap();
+        let anchor = format!("[» RV-1 việc con]({ANCHOR_SCHEME}{child})");
+        page.notes[0].body = format!("trước {anchor} sau");
+
+        let old = page.unlink_anchors(child);
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].0, parent);
+        assert!(old[0].1.contains(ANCHOR_SCHEME), "bản cũ còn neo");
+        assert_eq!(page.notes[0].body, "trước việc con sau");
     }
 
     #[test]

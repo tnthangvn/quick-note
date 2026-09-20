@@ -1,2 +1,15 @@
-target/
-.codegraph/
+# Build
+/target/
+**/*.rs.bk
+
+# Cache của công cụ phân tích mã
+/.codegraph/
+
+# File tạm khi gỡ lỗi (ảnh chụp frame, ảnh chuyển đổi)
+*.ppm
+*.json.tmp
+*.json.broken
+
+# Rác hệ điều hành / editor
+.DS_Store
+*.swp

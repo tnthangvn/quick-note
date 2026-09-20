@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use egui::{Key, KeyboardShortcut, Modifiers};
 use uuid::Uuid;
 
+use crate::attach;
 use crate::autostart;
 use crate::config::Config;
 use crate::dock::{self, Dock, DockFrame, DockView};
@@ -29,6 +30,8 @@ enum Deleted {
         page_id: Uuid,
         note: Note,
         links: Vec<Link>,
+        /// Nội dung cũ của các note từng chứa neo trỏ tới note này.
+        anchors: Vec<(Uuid, String)>,
     },
     Link {
         page_id: Uuid,
@@ -250,7 +253,7 @@ impl QuickNoteApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             Action::SetAutostart(on) => self.set_autostart(on),
-            Action::SplitSelection(note) => self.split_selection(note),
+            Action::SplitSelection(note) => self.split_selection(note, ctx),
             Action::OpenSettings => self.settings_draft = Some(self.cfg.clone()),
             Action::ExportMarkdown => {
                 match storage::export_markdown(&self.dir, self.ws.active_page()) {
@@ -264,25 +267,35 @@ impl QuickNoteApp {
     fn delete_note(&mut self, id: Uuid) {
         let page = self.ws.active_page_mut();
         let page_id = page.id;
-        if let Some((note, links)) = page.remove_note(id) {
-            self.notify(format!("Đã xoá \"{}\"", note.display_title()), false);
-            self.push_trash(Deleted::Note {
-                page_id,
-                note,
-                links,
-            });
-            self.mark_changed();
+        // Neo trỏ tới note sắp xoá thành chữ thường, khỏi bấm vào chỗ trống.
+        let anchors = page.unlink_anchors(id);
+        match page.remove_note(id) {
+            Some((note, links)) => {
+                self.notify(format!("Đã xoá \"{}\"", note.display_title()), false);
+                self.push_trash(Deleted::Note {
+                    page_id,
+                    note,
+                    links,
+                    anchors,
+                });
+                self.mark_changed();
+            }
+            // Không xoá được: trả lại các neo vừa gỡ.
+            None => restore_bodies(page, anchors),
         }
     }
 
     /// Cắt phần bôi đen khỏi note cha, tạo note con mang mã ticket, và để lại
     /// một neo bấm được ở đúng chỗ vừa cắt.
-    fn split_selection(&mut self, parent: Uuid) {
-        let Some(sel) = self
+    fn split_selection(&mut self, parent: Uuid, ctx: &egui::Context) {
+        // Ưu tiên vùng nhớ: cú nhấn nút » vừa xoá vùng chọn sống.
+        let selection = self
             .canvas
             .selection
-            .filter(|s| s.note == parent && !s.is_empty())
-        else {
+            .filter(|s| s.note == parent)
+            .or_else(|| canvas::selected_range(ctx, parent))
+            .filter(|s| s.note == parent && !s.is_empty());
+        let Some(sel) = selection else {
             self.notify("Bôi đen một đoạn trong note rồi bấm »", true);
             return;
         };
@@ -322,6 +335,48 @@ impl QuickNoteApp {
         self.canvas.selection = None;
         self.canvas.flash = Some((child, Instant::now()));
         self.notify(format!("Đã tách thành {ticket}"), false);
+        self.mark_changed();
+    }
+
+    /// Dán ảnh trong clipboard vào note: lưu ra file rồi chèn Markdown.
+    /// Clipboard chỉ có chữ thì không làm gì (ô soạn thảo đã tự dán).
+    fn paste_image(&mut self, note_id: Uuid, ctx: &egui::Context) {
+        let Some(pasted) = attach::clipboard_image() else {
+            return;
+        };
+        let (path, what) = match pasted {
+            attach::Pasted::Image(image) => {
+                let size = format!("{}×{}", image.width, image.height);
+                match attach::save_png(&self.dir, &image) {
+                    Ok(path) => (path, size),
+                    Err(e) => {
+                        self.notify(format!("Không lưu được ảnh: {e:#}"), true);
+                        return;
+                    }
+                }
+            }
+            // File ảnh có sẵn: dùng thẳng, không sao chép.
+            attach::Pasted::File(path) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (path, name)
+            }
+        };
+
+        let markdown = attach::markdown_for(&path);
+        let at = canvas::cursor_index(ctx, note_id);
+        let page = self.ws.active_page_mut();
+        let Some(note) = page.notes.iter_mut().find(|n| n.id == note_id) else {
+            return;
+        };
+        match at {
+            Some(at) => replace_char_range(&mut note.body, at, at, &markdown),
+            None => note.body.push_str(&markdown),
+        }
+        note.updated_at = crate::model::now_ts();
+        self.notify(format!("Đã chèn ảnh {what}"), false);
         self.mark_changed();
     }
 
@@ -448,10 +503,12 @@ impl QuickNoteApp {
                 page_id,
                 note,
                 links,
+                anchors,
             }) => {
                 let idx = self.activate_page(page_id);
                 let page = &mut self.ws.pages[idx];
                 page.insert_note(note);
+                restore_bodies(page, anchors);
                 // Only arrows whose other end still exists come back.
                 for link in links {
                     let (from, to) = (link.from, link.to);
@@ -702,6 +759,10 @@ impl eframe::App for QuickNoteApp {
             }
         }
 
+        #[cfg(debug_assertions)]
+        if crate::debug_shot::edit_first_note() && self.canvas.editing_body.is_none() {
+            self.canvas.editing_body = self.ws.active_page().notes.first().map(|n| n.id);
+        }
         let mut actions = std::mem::take(&mut self.queued);
         self.shortcuts(&ctx, &mut actions);
 
@@ -731,6 +792,7 @@ impl eframe::App for QuickNoteApp {
         let mut delete = None;
         let mut delete_link = None;
         let mut split = None;
+        let mut paste_image = None;
         let canvas_frame = egui::Frame::central_panel(ui.style()).inner_margin(0);
         egui::CentralPanel::default()
             .frame(canvas_frame)
@@ -744,6 +806,7 @@ impl eframe::App for QuickNoteApp {
                 delete = out.delete;
                 delete_link = out.delete_link;
                 split = out.split;
+                paste_image = out.paste_image;
                 if out.changed {
                     self.mark_changed();
                 }
@@ -755,7 +818,10 @@ impl eframe::App for QuickNoteApp {
             self.delete_link(id);
         }
         if let Some(id) = split {
-            self.split_selection(id);
+            self.split_selection(id, &ctx);
+        }
+        if let Some(id) = paste_image {
+            self.paste_image(id, &ctx);
         }
 
         for action in actions {
@@ -790,8 +856,17 @@ impl eframe::App for QuickNoteApp {
     }
 }
 
+/// Trả lại nội dung cũ cho các note (dùng khi hoàn tác gỡ neo).
+fn restore_bodies(page: &mut Page, bodies: Vec<(Uuid, String)>) {
+    for (id, body) in bodies {
+        if let Some(note) = page.notes.iter_mut().find(|n| n.id == id) {
+            note.body = body;
+        }
+    }
+}
+
 /// Neo nội bộ: `quicknote://note/<uuid>`.
-pub const ANCHOR_SCHEME: &str = "quicknote://note/";
+pub use crate::model::ANCHOR_SCHEME;
 
 fn note_anchor(url: &str) -> Option<Uuid> {
     Uuid::parse_str(url.strip_prefix(ANCHOR_SCHEME)?).ok()

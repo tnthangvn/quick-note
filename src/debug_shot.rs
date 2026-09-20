@@ -6,6 +6,10 @@ use std::io::Write;
 const WARMUP_FRAMES: u64 = 20;
 // QUICK_NOTE_SCREENSHOT_FRAME cho phép chụp trễ hơn khi cần quan sát animation.
 
+pub fn edit_first_note() -> bool {
+    std::env::var("QUICK_NOTE_EDIT_FIRST").is_ok()
+}
+
 pub fn tick(ctx: &egui::Context) {
     let Ok(path) = std::env::var("QUICK_NOTE_SCREENSHOT") else {
         return;

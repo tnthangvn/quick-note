@@ -15,6 +15,7 @@ Cách dùng: $(basename "$0") [TUỲ CHỌN]
 
   (không tuỳ chọn)   Build release và cài vào ~/.local
   -u, --uninstall    Gỡ app (giữ lại ghi chú trong ${CONFIG_DIR})
+      --full-clean   Xoá sạch thư mục target/ trước khi build (build lại từ đầu, lâu)
       --purge        Dùng kèm --uninstall: xoá luôn ghi chú + cài đặt (có hỏi xác nhận)
   -h, --help         Hiện trợ giúp này
 EOF
@@ -33,9 +34,35 @@ install_desktop_entry() {
     fi
 }
 
+# Xoá cache của desktop/icon để icon và mục menu mới hiện ngay, không phải
+# đăng xuất. Mỗi cache là một chỗ hệ thống nhớ bản cũ.
 refresh_caches() {
-    update-desktop-database "${APP_DIR}" >/dev/null 2>&1 || true
-    gtk-update-icon-cache -q "${DATA_HOME}/icons/hicolor" >/dev/null 2>&1 || true
+    echo "Dọn cache desktop/icon:"
+    rm -f "${DATA_HOME}/icons/hicolor/icon-theme.cache"
+    echo "  - icon-theme.cache (bộ nhớ icon của GTK)"
+    gtk-update-icon-cache -q -f -t "${DATA_HOME}/icons/hicolor" 2>/dev/null &&
+        echo "  - dựng lại icon cache" || true
+    update-desktop-database "${APP_DIR}" 2>/dev/null &&
+        echo "  - mimeinfo.cache (danh sách ứng dụng)" || true
+    rm -rf "${HOME}/.cache/menus"
+    echo "  - ~/.cache/menus (cache menu XDG)"
+    if command -v xdg-desktop-menu >/dev/null 2>&1; then
+        xdg-desktop-menu forceupdate 2>/dev/null &&
+            echo "  - xdg-desktop-menu forceupdate" || true
+    fi
+}
+
+# Luôn build lại mã của app (giữ cache của thư viện ngoài để không mất 5 phút).
+# --full-clean thì xoá sạch, kể cả thư viện.
+clean_build_cache() {
+    local full="$1"
+    if [[ "$full" == 1 ]]; then
+        echo "Xoá sạch target/ …"
+        cargo clean --manifest-path "${ROOT}/Cargo.toml"
+    else
+        # Cần --release: không có cờ này cargo chỉ dọn hồ sơ debug.
+        cargo clean -p quick-note --release --manifest-path "${ROOT}/Cargo.toml"
+    fi
 }
 
 uninstall() {
@@ -75,6 +102,7 @@ install_app() {
         exit 1
     fi
 
+    clean_build_cache "${FULL_CLEAN:-0}"
     cargo build --release --manifest-path "${ROOT}/Cargo.toml"
 
     # Stop a running copy so the binary can be replaced and the new version starts clean.
@@ -94,11 +122,13 @@ install_app() {
 
 main() {
     local mode=install purge=0
+    FULL_CLEAN=0
     for arg in "$@"; do
         case "$arg" in
             -h | --help) usage; exit 0 ;;
             -u | --uninstall) mode=uninstall ;;
             --purge) purge=1 ;;
+            --full-clean) FULL_CLEAN=1 ;;
             *) echo "Tuỳ chọn không hợp lệ: $arg" >&2; usage >&2; exit 1 ;;
         esac
     done

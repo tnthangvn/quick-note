@@ -328,10 +328,26 @@ impl<N: Fn()> Worker<N> {
 
     fn push(&mut self, ws: &Workspace) -> Result<usize> {
         let export_md = self.cfg.export_markdown;
+        // Ảnh dán trong note nằm ở file riêng: đẩy kèm để bản sao đủ dùng.
+        let attachments: Vec<std::path::PathBuf> = ws
+            .pages
+            .iter()
+            .flat_map(|p| p.notes.iter())
+            .flat_map(|n| crate::attach::referenced_files(&n.body))
+            .filter(|p| p.is_file())
+            .collect();
         let (mut drive, folder) = self.drive()?;
         let json = serde_json::to_vec_pretty(ws)?;
         drive.upsert(&folder, REMOTE_WORKSPACE, "application/json", json)?;
         let mut files = 1;
+        for path in attachments {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let bytes = std::fs::read(&path)?;
+            drive.upsert(&folder, name, "image/png", bytes)?;
+            files += 1;
+        }
         if export_md {
             for (page, name) in ws.pages.iter().zip(export::unique_file_names(&ws.pages)) {
                 drive.upsert(

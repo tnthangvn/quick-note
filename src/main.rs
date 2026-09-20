@@ -1,6 +1,7 @@
 //! Quick Note — sticky-note canvas with pages and Google Drive sync.
 
 mod app;
+mod attach;
 mod autostart;
 mod cli;
 mod config;
@@ -41,6 +42,26 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    if args.clipboard_check {
+        let types = attach::clipboard_types();
+        if types.is_empty() {
+            println!(
+                "Clipboard trống (hoặc app nguồn đã đóng — Wayland chỉ giữ dữ liệu khi app nguồn còn chạy)."
+            );
+        } else {
+            println!("Kiểu dữ liệu trong clipboard:");
+            for t in &types {
+                println!("  - {t}");
+            }
+        }
+        match attach::clipboard_image() {
+            Some(attach::Pasted::Image(i)) => println!("→ Dán được: ảnh {}×{}", i.width, i.height),
+            Some(attach::Pasted::File(p)) => println!("→ Dán được: file ảnh {}", p.display()),
+            None => println!("→ Không có ảnh để dán."),
+        }
+        return Ok(());
+    }
+
     let dir = storage::app_dir().unwrap_or_else(|e| fail(e));
     if args.drive_check {
         let cfg = config::Config::load(&dir).unwrap_or_else(|e| fail(e));
@@ -61,6 +82,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             install_system_font(&cc.egui_ctx);
+            // Cho phép hiển thị ảnh `file://` trong note.
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(app::QuickNoteApp::new(cc, dir, dock)))
         }),
     )
