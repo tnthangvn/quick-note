@@ -96,6 +96,10 @@ pub fn settings(
                 ui.add(egui::DragValue::new(&mut draft.auto_sync_minutes).range(0..=240).suffix(" phút"));
                 ui.label(RichText::new("(0 = tắt)").weak());
             });
+            ui.checkbox(
+                &mut draft.sync_on_blur,
+                "Đồng bộ lên Drive khi rời cửa sổ (luôn lưu local trước; hết dung lượng thì chỉ giữ local)",
+            );
             ui.checkbox(&mut draft.autostart, "Khởi động cùng máy (tự chạy khi đăng nhập)");
             ui.checkbox(&mut draft.markdown, "Hiển thị Markdown (tiêu đề, **đậm**, danh sách, - [ ] checkbox, link)");
             ui.horizontal(|ui| {

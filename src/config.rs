@@ -71,6 +71,9 @@ pub struct Config {
     pub drive: DriveConfig,
     /// Push to Drive every N minutes when there are changes. 0 = off.
     pub auto_sync_minutes: u32,
+    /// Đẩy lên Drive ngay khi cửa sổ mất focus (nếu có thay đổi chưa đồng bộ).
+    /// Dữ liệu vẫn luôn được lưu local trước; Drive chỉ là bản sao.
+    pub sync_on_blur: bool,
     pub font_size: f32,
     /// Show note bodies as rendered Markdown when not editing.
     pub markdown: bool,
@@ -84,6 +87,7 @@ impl Default for Config {
         Self {
             drive: DriveConfig::default(),
             auto_sync_minutes: 0,
+            sync_on_blur: false,
             font_size: 15.0,
             markdown: true,
             dock: DockConfig::default(),

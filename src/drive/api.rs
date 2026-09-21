@@ -223,10 +223,21 @@ fn multipart_related(
 }
 
 fn api_error(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| body.chars().take(200).collect())
+    let Some(v) = serde_json::from_str::<serde_json::Value>(body).ok() else {
+        return body.chars().take(200).collect();
+    };
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    // reason ổn định (không đổi theo ngôn ngữ), vd "storageQuotaExceeded".
+    let reason = v["error"]["errors"][0]["reason"]
+        .as_str()
+        .or_else(|| v["error"]["status"].as_str())
+        .unwrap_or("");
+    match (msg.is_empty(), reason.is_empty()) {
+        (false, false) => format!("{msg} [{reason}]"),
+        (false, true) => msg.to_owned(),
+        (true, false) => reason.to_owned(),
+        (true, true) => body.chars().take(200).collect(),
+    }
 }
 
 #[cfg(test)]
@@ -255,5 +266,12 @@ mod tests {
             api_error(r#"{"error":{"message":"File not found"}}"#),
             "File not found"
         );
+    }
+
+    #[test]
+    fn api_error_appends_stable_reason() {
+        let body = r#"{"error":{"message":"The user's Drive storage quota has been exceeded.","errors":[{"reason":"storageQuotaExceeded"}]}}"#;
+        let out = api_error(body);
+        assert!(out.contains("storageQuotaExceeded"), "got: {out}");
     }
 }

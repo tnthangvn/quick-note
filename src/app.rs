@@ -25,6 +25,16 @@ const UNDO_LIMIT: usize = 20;
 const TOAST_TTL: Duration = Duration::from_secs(5);
 const NEW_NOTE_ANCHOR: [f32; 2] = [40.0, 40.0];
 
+/// Lỗi Drive do hết dung lượng lưu trữ. Khớp cả `reason` ổn định của API lẫn
+/// câu chữ tiếng Anh, phòng khi reason không có trong body.
+fn is_quota_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("storagequotaexceeded")
+        || m.contains("quotaexceeded")
+        || m.contains("storage quota")
+        || (m.contains("quota") && m.contains("exceed"))
+}
+
 enum Deleted {
     Note {
         page_id: Uuid,
@@ -70,6 +80,11 @@ pub struct QuickNoteApp {
     edit_gen: u64,
     pushed_gen: u64,
     last_push: Instant,
+    /// Trạng thái focus của cửa sổ ở khung trước, để bắt lúc chuyển sang mất focus.
+    was_focused: bool,
+    /// Drive báo hết dung lượng: tạm dừng tự đồng bộ, chỉ giữ bản local, cho tới
+    /// khi người dùng bấm đồng bộ tay hoặc một lần đẩy thành công.
+    quota_blocked: bool,
     toast: Option<Toast>,
     /// Recently deleted items, newest last (bounded).
     trash: Vec<Deleted>,
@@ -128,6 +143,8 @@ impl QuickNoteApp {
             edit_gen: 0,
             pushed_gen: 0,
             last_push: Instant::now(),
+            was_focused: true,
+            quota_blocked: false,
             toast,
             trash: Vec::new(),
             canvas: CanvasState::default(),
@@ -176,9 +193,27 @@ impl QuickNoteApp {
             self.notify("Chưa kết nối Google Drive", true);
             return;
         }
+        // Lệnh đẩy tay là lần thử lại: gỡ trạng thái tạm dừng do hết dung lượng.
+        self.quota_blocked = false;
         self.drive.send(Command::Push(Box::new(self.ws.clone())));
         self.pushed_gen = self.edit_gen;
         self.last_push = Instant::now();
+    }
+
+    /// Cửa sổ vừa mất focus: luôn ghi bản local ngay, và nếu bật đồng-bộ-khi-rời
+    /// thì đẩy lên Drive (bỏ qua khi Drive đang bận hoặc đã hết dung lượng).
+    fn on_focus_lost(&mut self) {
+        if self.dirty_since.is_some() {
+            self.save_now();
+        }
+        if self.cfg.sync_on_blur
+            && self.unsynced
+            && self.drive_state.connected
+            && self.drive_state.busy.is_none()
+            && !self.quota_blocked
+        {
+            self.push();
+        }
     }
 
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
@@ -558,6 +593,7 @@ impl QuickNoteApp {
                 }
                 Event::Pushed { files } => {
                     self.drive_state.busy = None;
+                    self.quota_blocked = false;
                     self.unsynced = self.edit_gen != self.pushed_gen;
                     let now = chrono::Local::now().format("%H:%M").to_string();
                     self.notify(format!("Đã đồng bộ {files} file lên Drive"), false);
@@ -569,7 +605,17 @@ impl QuickNoteApp {
                 }
                 Event::Error(msg) => {
                     self.drive_state.busy = None;
-                    self.notify(msg, true);
+                    if is_quota_error(&msg) {
+                        // Bản local đã được ghi (save_now chạy độc lập với Drive),
+                        // nên dữ liệu vẫn an toàn; chỉ tạm dừng đẩy lên Drive.
+                        self.quota_blocked = true;
+                        self.notify(
+                            "Drive hết dung lượng — đã giữ bản local. Tạm dừng tự đồng bộ (bấm ⬆ Đồng bộ để thử lại).",
+                            true,
+                        );
+                    } else {
+                        self.notify(msg, true);
+                    }
                 }
             }
         }
@@ -636,6 +682,7 @@ impl QuickNoteApp {
             && self.unsynced
             && self.drive_state.connected
             && self.drive_state.busy.is_none()
+            && !self.quota_blocked
         {
             let interval = Duration::from_secs(u64::from(every) * 60);
             if self.last_push.elapsed() >= interval {
@@ -738,6 +785,13 @@ impl eframe::App for QuickNoteApp {
         self.handle_drive_events();
         self.handle_tray(&ctx);
         self.handle_signals(&ctx);
+
+        // Cửa sổ chuyển từ có focus sang mất focus: lưu (và có thể đồng bộ) ngay.
+        let focused = ctx.input(|i| i.focused);
+        if self.was_focused && !focused {
+            self.on_focus_lost();
+        }
+        self.was_focused = focused;
 
         if let Some(dock) = self.dock.as_mut() {
             let DockFrame { view, rect } = dock.update(&ctx, frame);
