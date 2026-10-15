@@ -146,7 +146,12 @@ fn page_tree_popup(ui: &mut Ui, ws: &Workspace, state: &mut ToolbarState, action
                 .hint_text("🔍 Tìm trang")
                 .desired_width(200.0),
         );
-        field.request_focus();
+        // Chỉ tự lấy focus khi chưa widget nào giữ focus (lúc popup vừa mở);
+        // nếu gọi mỗi frame sẽ cướp focus của ô đổi tên trang.
+        let nothing_focused = ui.memory(|m| m.focused().is_none());
+        if nothing_focused && state.renaming.is_none() {
+            field.request_focus();
+        }
         if !state.page_filter.is_empty() && ui.small_button("✕").clicked() {
             state.page_filter.clear();
         }
