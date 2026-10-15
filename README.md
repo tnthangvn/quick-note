@@ -55,6 +55,17 @@ curl https://sh.rustup.rs -sSf | sh           # nếu chưa có Rust
 ./scripts/install.sh                          # build release + cài vào ~/.local
 ```
 
+Hoặc dùng `make` (gõ `make help` để xem đủ):
+
+```bash
+make install        # build release + cài vào ~/.local
+make upgrade        # git pull rồi cài lại
+make uninstall      # gỡ app, giữ ghi chú (make purge: xoá cả ghi chú)
+make clean-cache    # icon/mục menu không cập nhật
+make clean          # xoá build của app, giữ cache thư viện (clean-all: xoá sạch target/)
+make lint           # fmt + clippy + test trước khi commit
+```
+
 Sau khi cài, bấm phím Super, gõ "Quick Note" để mở (script ghi đường dẫn tuyệt đối vào file `.desktop` nên GNOME tìm thấy ngay, không cần đăng nhập lại), hoặc mở từ menu ứng dụng hoặc chạy `quick-note`. Chạy lại script để cập nhật (tự tắt bản đang chạy).
 
 Gỡ cài đặt (ghi chú được giữ lại, thêm `--purge` để xoá cả ghi chú — có hỏi xác nhận):

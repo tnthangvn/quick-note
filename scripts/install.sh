@@ -16,6 +16,7 @@ Cách dùng: $(basename "$0") [TUỲ CHỌN]
   (không tuỳ chọn)   Build release và cài vào ~/.local
   -u, --uninstall    Gỡ app (giữ lại ghi chú trong ${CONFIG_DIR})
       --full-clean   Xoá sạch thư mục target/ trước khi build (build lại từ đầu, lâu)
+      --refresh-caches  Chỉ dọn cache desktop/icon/menu (icon hoặc mục menu không cập nhật)
       --purge        Dùng kèm --uninstall: xoá luôn ghi chú + cài đặt (có hỏi xác nhận)
   -h, --help         Hiện trợ giúp này
 EOF
@@ -129,6 +130,7 @@ main() {
             -u | --uninstall) mode=uninstall ;;
             --purge) purge=1 ;;
             --full-clean) FULL_CLEAN=1 ;;
+            --refresh-caches) mode=refresh ;;
             *) echo "Tuỳ chọn không hợp lệ: $arg" >&2; usage >&2; exit 1 ;;
         esac
     done
@@ -136,11 +138,11 @@ main() {
         echo "--purge chỉ dùng kèm --uninstall" >&2
         exit 1
     fi
-    if [[ "$mode" == uninstall ]]; then
-        uninstall "$purge"
-    else
-        install_app
-    fi
+    case "$mode" in
+        uninstall) uninstall "$purge" ;;
+        refresh) refresh_caches ;;
+        *) install_app ;;
+    esac
 }
 
 # `exit` on the same line: bash never reads past here, so editing this file while
