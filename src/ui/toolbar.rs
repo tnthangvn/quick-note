@@ -116,20 +116,50 @@ fn zoom_buttons(ui: &mut Ui, zoom: f32, actions: &mut Vec<Action>) {
 /// Nút bật/tắt danh sách trang: gom tất cả trang vào một popup cây thư mục có
 /// ô tìm kiếm, thay cho hàng tab ngang dễ tràn.
 fn page_menu(ui: &mut Ui, ws: &Workspace, state: &mut ToolbarState, actions: &mut Vec<Action>) {
-    let active_leaf = ws
-        .active_page()
-        .title
+    let active_idx = ws.active;
+    let active_title = ws.active_page().title.clone();
+    let active_leaf = active_title
         .rsplit(TREE_SEP)
         .next()
         .unwrap_or("")
         .trim();
-    let label = if active_leaf.is_empty() {
-        "🗂 Trang".to_string()
+
+    // Layout cha là phải-sang-trái, nên widget thêm trước nằm bên PHẢI.
+    // Thêm tên trang trước để nó đứng ngay cạnh phải nút danh sách 🗂.
+    if let Some((idx, text)) = state.renaming.as_mut().filter(|(i, _)| *i == active_idx) {
+        // Đổi tên ngay trên thanh công cụ, không dính popup danh sách.
+        let resp = ui.add(
+            TextEdit::singleline(text)
+                .desired_width(160.0)
+                .hint_text("Tên trang"),
+        );
+        if ui.memory(|m| m.focused().is_none()) {
+            resp.request_focus();
+        }
+        if resp.lost_focus() {
+            let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if !cancelled && !text.trim().is_empty() {
+                actions.push(Action::RenamePage(*idx, text.trim().to_string()));
+            }
+            state.renaming = None;
+        }
     } else {
-        format!("🗂 {active_leaf}  ({})", ws.pages.len())
-    };
+        let name = if active_leaf.is_empty() {
+            "(chưa đặt tên)"
+        } else {
+            active_leaf
+        };
+        if ui
+            .button(name)
+            .on_hover_text("Bấm để đổi tên trang này")
+            .clicked()
+        {
+            state.renaming = Some((active_idx, active_title.clone()));
+        }
+    }
+
     let btn = ui
-        .button(label)
+        .button(format!("🗂 {}", ws.pages.len()))
         .on_hover_text("Danh sách trang (tìm kiếm, cây thư mục)");
 
     Popup::menu(&btn)
