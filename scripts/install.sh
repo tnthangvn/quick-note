@@ -103,6 +103,21 @@ install_app() {
         exit 1
     fi
 
+    # In commit đang build: nếu máy khác ra bản cũ, thường là checkout chưa
+    # `git pull`. Script này chỉ build code hiện có, KHÔNG tự kéo bản mới
+    # (dùng `make upgrade` để pull + build + cài).
+    if command -v git >/dev/null 2>&1 && git -C "${ROOT}" rev-parse --git-dir >/dev/null 2>&1; then
+        local head dirty=""
+        head="$(git -C "${ROOT}" log -1 --format='%h %s' 2>/dev/null)"
+        git -C "${ROOT}" diff --quiet 2>/dev/null || dirty=" (+ thay đổi chưa commit)"
+        echo "Build commit: ${head}${dirty}"
+        if git -C "${ROOT}" rev-parse '@{u}' >/dev/null 2>&1; then
+            local behind
+            behind="$(git -C "${ROOT}" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)"
+            [[ "${behind:-0}" -gt 0 ]] && echo "Lưu ý: đang sau origin ${behind} commit — chạy 'git pull' hoặc 'make upgrade' để lấy bản mới." >&2
+        fi
+    fi
+
     clean_build_cache "${FULL_CLEAN:-0}"
     cargo build --release --manifest-path "${ROOT}/Cargo.toml"
 
@@ -113,12 +128,21 @@ install_app() {
     install_desktop_entry
     refresh_caches
 
-    echo "Đã cài: ${BIN_DIR}/quick-note"
+    local ver
+    ver="$("${BIN_DIR}/quick-note" --version 2>/dev/null || echo '?')"
+    echo "Đã cài: ${BIN_DIR}/quick-note (${ver})"
     echo "Mở từ menu ứng dụng: bấm Super, gõ \"Quick Note\" (nếu chưa thấy, đợi vài giây hoặc đăng xuất/đăng nhập lại)."
     case ":${PATH}:" in
         *":${BIN_DIR}:"*) ;;
         *) echo "Lưu ý: thêm ${BIN_DIR} vào PATH (Ubuntu thường tự thêm sau khi đăng nhập lại)." ;;
     esac
+    # Một bản quick-note khác đứng TRƯỚC trong PATH sẽ chạy khi gõ `quick-note`
+    # ở terminal, nên trông như bản vừa cài không có tác dụng.
+    local first; first="$(command -v quick-note 2>/dev/null || true)"
+    if [[ -n "$first" && "$first" != "${BIN_DIR}/quick-note" ]]; then
+        echo "CẢNH BÁO: '${first}' đứng trước trong PATH, gõ \"quick-note\" sẽ chạy bản đó, KHÔNG phải bản vừa cài." >&2
+        echo "  Gỡ bản cũ (vd: sudo apt remove quick-note / rm '${first}') hoặc đưa ${BIN_DIR} lên đầu PATH." >&2
+    fi
 }
 
 main() {
